@@ -68,6 +68,10 @@ jobs:
           CX_USERNAME: ${{ secrets.CX_USERNAME }}
           CX_PASSWORD: ${{ secrets.CX_PASSWORD }}
           DISPATCH_PAYLOAD: ${{ toJson(matrix.user) }}
+          CHAOJIYING_USERNAME: ${{ secrets.CHAOJIYING_USERNAME }}
+          CHAOJIYING_PASSWORD: ${{ secrets.CHAOJIYING_PASSWORD }}
+          CHAOJIYING_SOFT_ID: ${{ secrets.CHAOJIYING_SOFT_ID }}
+          CHAOJIYING_CODETYPE: ${{ secrets.CHAOJIYING_CODETYPE }}
           TULINGCLOUD_USERNAME: ${{ secrets.TULINGCLOUD_USERNAME }}
           TULINGCLOUD_PASSWORD: ${{ secrets.TULINGCLOUD_PASSWORD }}
           TULINGCLOUD_MODEL_ID: ${{ secrets.TULINGCLOUD_MODEL_ID }}
@@ -242,6 +246,10 @@ jobs:
         env:
           CX_USERNAME: ${{ secrets.CX_USERNAME }}
           CX_PASSWORD: ${{ secrets.CX_PASSWORD }}
+          CHAOJIYING_USERNAME: ${{ secrets.CHAOJIYING_USERNAME }}
+          CHAOJIYING_PASSWORD: ${{ secrets.CHAOJIYING_PASSWORD }}
+          CHAOJIYING_SOFT_ID: ${{ secrets.CHAOJIYING_SOFT_ID }}
+          CHAOJIYING_CODETYPE: ${{ secrets.CHAOJIYING_CODETYPE }}
           TULINGCLOUD_USERNAME: ${{ secrets.TULINGCLOUD_USERNAME }}
           TULINGCLOUD_PASSWORD: ${{ secrets.TULINGCLOUD_PASSWORD }}
           TULINGCLOUD_MODEL_ID: ${{ secrets.TULINGCLOUD_MODEL_ID }}

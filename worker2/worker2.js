@@ -1,5 +1,5 @@
 // worker2.js
-// 独立兜底 Worker：通过 Cloudflare KV REST API 跨账号读取 tongyi 的心跳 KV，并用小时锁避免重复兜底
+// 独立兜底 Worker：通过 Cloudflare KV REST API 跨账号读取 tongyi 的心跳 KV，并按“学校 + 日期”避免重复兜底
 
 function beijingNow(baseTimestampMs = Date.now()) {
   return new Date(baseTimestampMs + 8 * 3600 * 1000);
@@ -54,8 +54,7 @@ const HEARTBEAT_LAST_MINUTE_KEY = "meta:heartbeat:last_minute";
 const HEARTBEAT_INTERVAL_MS = 60 * 1000;
 const HEARTBEAT_TIMEOUT_MS = 2 * HEARTBEAT_INTERVAL_MS + 10 * 1000;
 const HEARTBEAT_CONFIRM_DELAY_MS = 8000;
-const FALLBACK_HOUR_LOCK_PREFIX = "meta:fallback_hour_lock";
-const FALLBACK_HOUR_LOCK_TTL_SECONDS = 48 * 60 * 60;
+const FALLBACK_TRIGGER_PREFIX = "meta:fallback_trigger";
 const WORKER2_SETTINGS_KEY = "meta:worker2:settings";
 const WORKER2_RECORD_PREFIX = "meta:worker2:records";
 const WORKER2_RECORD_LIMIT = 300;
@@ -63,15 +62,6 @@ const WORKER2_RECORD_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const WORKER2_RECORD_TTL_SECONDS = 48 * 60 * 60;
 const WORKER2_DEPLOYED_UTC_CRONS = ["* * * * *"];
 const DEFAULT_WORKER2_BEIJING_CRONS = ["54-57 5-21 * * *", "24-27 21 * * *"];
-
-function beijingDateHour(baseTimestampMs = Date.now()) {
-  const d = beijingNow(baseTimestampMs);
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(d.getUTCDate()).padStart(2, "0");
-  const hour = String(d.getUTCHours()).padStart(2, "0");
-  return `${y}-${m}-${day}-${hour}`;
-}
 
 async function sleep(ms) {
   if (ms <= 0) return;
@@ -220,9 +210,70 @@ function matchesBeijingCronLine(line, baseTimestampMs = Date.now()) {
   );
 }
 
+function getMatchedBeijingCronLines(lines, baseTimestampMs = Date.now()) {
+  const items = Array.isArray(lines) ? lines : [];
+  return items.filter(line => matchesBeijingCronLine(line, baseTimestampMs));
+}
+
+function nextOccurrenceForBeijingCronLine(line, baseTimestampMs = Date.now()) {
+  const parts = String(line || "").trim().split(/\s+/);
+  if (parts.length !== 5) return null;
+
+  let minutes = [];
+  let hours = [];
+  try {
+    minutes = parseCronField(parts[0], 0, 59);
+    hours = parseCronField(parts[1], 0, 23);
+  } catch (_) {
+    return null;
+  }
+
+  const d = beijingNow(baseTimestampMs);
+  const year = d.getUTCFullYear();
+  const month = d.getUTCMonth();
+  const day = d.getUTCDate();
+  let nextTimestampMs = null;
+
+  for (let dayOffset = 0; dayOffset <= 2; dayOffset++) {
+    for (const hour of hours) {
+      for (const minute of minutes) {
+        const candidateMs = Date.UTC(year, month, day + dayOffset, hour, minute, 0) - 8 * 3600 * 1000;
+        if (candidateMs <= baseTimestampMs) continue;
+        if (nextTimestampMs === null || candidateMs < nextTimestampMs) {
+          nextTimestampMs = candidateMs;
+        }
+      }
+    }
+  }
+
+  if (nextTimestampMs === null) return null;
+  return {
+    line,
+    scheduledAt: new Date(nextTimestampMs).toISOString(),
+    beijing_date: beijingDate(nextTimestampMs),
+    beijing_time: beijingHMS(nextTimestampMs),
+    timestampMs: nextTimestampMs,
+  };
+}
+
+function getNextBeijingCronOccurrence(lines, baseTimestampMs = Date.now()) {
+  const items = Array.isArray(lines) ? lines : [];
+  let nextItem = null;
+
+  for (const line of items) {
+    const candidate = nextOccurrenceForBeijingCronLine(line, baseTimestampMs);
+    if (!candidate) continue;
+    if (!nextItem || candidate.timestampMs < nextItem.timestampMs) {
+      nextItem = candidate;
+    }
+  }
+
+  return nextItem;
+}
+
 function matchesWorker2Schedule(settings, baseTimestampMs = Date.now()) {
   const crons = normalizeBeijingCronLines(settings?.beijingCrons, DEFAULT_WORKER2_BEIJING_CRONS);
-  return crons.some(line => matchesBeijingCronLine(line, baseTimestampMs));
+  return getMatchedBeijingCronLines(crons, baseTimestampMs).length > 0;
 }
 
 async function getWorker2Settings(env) {
@@ -286,7 +337,7 @@ function summarizeWatchdogResult(result) {
     diffSeconds: result?.diffSeconds ?? null,
     thresholdSeconds: result?.thresholdMs ? Math.floor(result.thresholdMs / 1000) : Math.floor(HEARTBEAT_TIMEOUT_MS / 1000),
     heartbeatRecheck: result?.heartbeatRecheck || null,
-    fallbackHourKey: result?.fallbackHourKey || "",
+    fallbackDate: result?.fallbackDate || "",
     dueCount: fallback?.dueCount ?? 0,
     fallbackSummary,
     fallbackResults: Array.isArray(fallback?.results) ? fallback.results : [],
@@ -373,25 +424,17 @@ function normalizeScheduledTimeMs(value) {
   return null;
 }
 
-function buildFallbackHourLockKey(hourKey) {
-  return `${FALLBACK_HOUR_LOCK_PREFIX}:${hourKey}`;
+function buildFallbackTriggerKey(dateText, schoolId) {
+  return `${FALLBACK_TRIGGER_PREFIX}:${dateText}:${schoolId}`;
 }
 
-async function getFallbackHourLock(env, hourKey) {
-  const raw = await getRemoteKvText(env, buildFallbackHourLockKey(hourKey));
+async function getFallbackTriggerRecord(env, dateText, schoolId) {
+  const raw = await getRemoteKvText(env, buildFallbackTriggerKey(dateText, schoolId));
   return raw ? JSON.parse(raw) : null;
 }
 
-async function saveFallbackHourLock(env, hourKey, record) {
-  await putRemoteKvText(
-    env,
-    buildFallbackHourLockKey(hourKey),
-    JSON.stringify(record),
-    {
-      expirationTtl: FALLBACK_HOUR_LOCK_TTL_SECONDS,
-    },
-  );
-  return record;
+function isScheduledTriggerRecord(record) {
+  return !!record && record.mode === "scheduled";
 }
 
 function parseTimeToSeconds(text) {
@@ -408,22 +451,31 @@ function parseTimeToSeconds(text) {
   return hour * 3600 + minute * 60 + second;
 }
 
-function shouldTriggerSchoolNow(school) {
-  const nowHHMM = beijingHHMM();
-  const nowHMS = beijingHMS();
+function isSchoolWindowCrossMidnight(school) {
   const triggerTime = String(school?.trigger_time || "").trim();
   const endtime = String(school?.endtime || "").trim();
-
-  if (!triggerTime) return false;
-  if (nowHHMM < triggerTime) return false;
-
-  if (!endtime) return true;
-
-  const nowSeconds = parseTimeToSeconds(nowHMS);
+  const triggerSeconds = parseTimeToSeconds(triggerTime);
   const endSeconds = parseTimeToSeconds(endtime);
-  if (nowSeconds === null || endSeconds === null) return true;
+  return triggerSeconds !== null && endSeconds !== null && endSeconds < triggerSeconds;
+}
 
-  return nowSeconds <= endSeconds;
+function shouldTriggerSchoolNow(school, baseTimestampMs = Date.now()) {
+  const triggerTime = String(school?.trigger_time || "").trim();
+  const endtime = String(school?.endtime || "").trim();
+  const triggerSeconds = parseTimeToSeconds(triggerTime);
+  const nowSeconds = parseTimeToSeconds(beijingHMS(baseTimestampMs));
+
+  if (triggerSeconds === null) return false;
+  if (nowSeconds === null) return false;
+  if (!endtime) return nowSeconds >= triggerSeconds;
+
+  const endSeconds = parseTimeToSeconds(endtime);
+  if (endSeconds === null) return true;
+
+  if (endSeconds < triggerSeconds) {
+    return nowSeconds >= triggerSeconds || nowSeconds <= endSeconds;
+  }
+  return nowSeconds >= triggerSeconds && nowSeconds <= endSeconds;
 }
 
 async function fetchJson(url, init = {}) {
@@ -452,9 +504,9 @@ async function getSchools(env) {
   return data.schools || [];
 }
 
-async function getDueSchools(env) {
+async function getDueSchools(env, baseTimestampMs = Date.now()) {
   const schools = await getSchools(env);
-  return schools.filter(shouldTriggerSchoolNow);
+  return schools.filter(school => shouldTriggerSchoolNow(school, baseTimestampMs));
 }
 
 async function triggerSchool(env, schoolId, options = {}) {
@@ -602,11 +654,33 @@ function formatFallbackMessages(title, lines, fallback) {
 }
 
 async function triggerDueSchools(env, options = {}, dueSchools = null) {
-  const schoolsToTrigger = Array.isArray(dueSchools) ? dueSchools : await getDueSchools(env);
+  const referenceTimeMs = options.referenceTimeMs ?? Date.now();
+  const schoolsToTrigger = Array.isArray(dueSchools) ? dueSchools : await getDueSchools(env, referenceTimeMs);
+  const fallbackDate = beijingDate(referenceTimeMs);
   const results = [];
 
   for (const school of schoolsToTrigger) {
+    const schoolFallbackDate = isSchoolWindowCrossMidnight(school)
+      && parseTimeToSeconds(beijingHMS(referenceTimeMs)) >= parseTimeToSeconds(school?.trigger_time)
+      ? beijingDate(referenceTimeMs + 24 * 60 * 60 * 1000)
+      : fallbackDate;
     try {
+      if (options.fallbackMode === "scheduled") {
+        const existingRecord = await getFallbackTriggerRecord(env, schoolFallbackDate, school.id);
+        if (isScheduledTriggerRecord(existingRecord)) {
+          results.push({
+            ok: true,
+            id: school.id,
+            name: school.name,
+            skipped: true,
+            reason: "fallback_already_triggered_today",
+            fallbackDate: schoolFallbackDate,
+            fallbackKey: buildFallbackTriggerKey(schoolFallbackDate, school.id),
+            fallbackRecord: existingRecord,
+          });
+          continue;
+        }
+      }
       const result = await triggerSchool(env, school.id, options);
       results.push({
         ok: true,
@@ -617,6 +691,8 @@ async function triggerDueSchools(env, options = {}, dueSchools = null) {
         totalBatches: result.totalBatches || 0,
         skipped: !!result.skipped,
         reason: result.reason || "",
+        fallbackDate: schoolFallbackDate,
+        fallbackKey: buildFallbackTriggerKey(schoolFallbackDate, school.id),
       });
     } catch (e) {
       results.push({
@@ -624,12 +700,15 @@ async function triggerDueSchools(env, options = {}, dueSchools = null) {
         id: school.id,
         name: school.name,
         error: e.message || String(e),
+        fallbackDate: schoolFallbackDate,
+        fallbackKey: buildFallbackTriggerKey(schoolFallbackDate, school.id),
       });
     }
   }
 
   return {
     checkedAt: new Date().toISOString(),
+    fallbackDate,
     dueCount: schoolsToTrigger.length,
     results,
   };
@@ -638,7 +717,7 @@ async function triggerDueSchools(env, options = {}, dueSchools = null) {
 async function runWatchdog(env, options = {}) {
   const nowIso = new Date().toISOString();
   const referenceTimeMs = options.referenceTimeMs ?? Date.now();
-  const hourKey = beijingDateHour(referenceTimeMs);
+  const fallbackDate = beijingDate(referenceTimeMs);
   if (!options.manual) {
     let settings = null;
     try {
@@ -652,7 +731,7 @@ async function runWatchdog(env, options = {}) {
           reason: "worker2_detection_disabled",
           now: nowIso,
           beijing_time: beijingHMS(),
-          fallbackHourKey: hourKey,
+          fallbackDate,
           settings,
         };
       }
@@ -668,7 +747,7 @@ async function runWatchdog(env, options = {}) {
         reason: "outside_configured_detection_time",
         now: nowIso,
         beijing_time: beijingHMS(referenceTimeMs),
-        fallbackHourKey: hourKey,
+        fallbackDate,
         settings,
       };
     }
@@ -684,7 +763,7 @@ async function runWatchdog(env, options = {}) {
         "worker2 告警：无法读取 tongyi 心跳 KV，已跳过兜底。",
         `错误: ${e.message || String(e)}`,
         `北京时间: ${beijingHMS()}`,
-        `小时锁: ${hourKey}`,
+        `兜底日期: ${fallbackDate}`,
       ].join("\n")
     );
     return {
@@ -697,7 +776,7 @@ async function runWatchdog(env, options = {}) {
       beijing_time: beijingHMS(),
       heartbeatKey: HEARTBEAT_LAST_TS_KEY,
       heartbeatMinuteKey: HEARTBEAT_LAST_MINUTE_KEY,
-      fallbackHourKey: hourKey,
+      fallbackDate,
       notification,
     };
   }
@@ -712,6 +791,7 @@ async function runWatchdog(env, options = {}) {
   const fallbackOptions = {
     triggerSource: "worker2",
     fallbackMode: options.manual ? "manual" : "scheduled",
+    referenceTimeMs,
   };
 
   if (isStale) {
@@ -762,11 +842,11 @@ async function runWatchdog(env, options = {}) {
       diffSeconds,
       thresholdMs: HEARTBEAT_TIMEOUT_MS,
       heartbeatRecheck,
-      fallbackHourKey: hourKey,
+      fallbackDate,
     };
   }
 
-  const dueSchools = await getDueSchools(env);
+  const dueSchools = await getDueSchools(env, referenceTimeMs);
   if (dueSchools.length === 0) {
     return {
       ok: false,
@@ -784,106 +864,7 @@ async function runWatchdog(env, options = {}) {
       diffSeconds,
       thresholdMs: HEARTBEAT_TIMEOUT_MS,
       heartbeatRecheck,
-      fallbackHourKey: hourKey,
-    };
-  }
-
-  let existingLock = null;
-  try {
-    existingLock = await getFallbackHourLock(env, hourKey);
-  } catch (e) {
-    const notification = await sendFeishuText(
-      env,
-      [
-        "worker2 告警：无法读取兜底小时锁 KV，已跳过兜底。",
-        `错误: ${e.message || String(e)}`,
-        `北京时间: ${beijingHMS()}`,
-        `小时锁: ${hourKey}`,
-      ].join("\n")
-    );
-    return {
-      ok: false,
-      mode: "fallback_lock_unreachable",
-      manual: !!options.manual,
-      skipped: true,
-      reason: e.message || String(e),
-      now: nowIso,
-      beijing_time: beijingHMS(),
-      heartbeatKey: HEARTBEAT_LAST_TS_KEY,
-      heartbeatMinuteKey: HEARTBEAT_LAST_MINUTE_KEY,
-      heartbeatTs,
-      heartbeatMinuteSlot,
-      diffMs,
-      diffSeconds,
-      thresholdMs: HEARTBEAT_TIMEOUT_MS,
-      heartbeatRecheck,
-      fallbackHourKey: hourKey,
-      notification,
-    };
-  }
-  if (existingLock) {
-    return {
-      ok: false,
-      mode: "stale_locked",
-      manual: !!options.manual,
-      skipped: true,
-      reason: "fallback_already_executed_this_hour",
-      now: nowIso,
-      beijing_time: beijingHMS(),
-      heartbeatKey: HEARTBEAT_LAST_TS_KEY,
-      heartbeatMinuteKey: HEARTBEAT_LAST_MINUTE_KEY,
-      heartbeatTs,
-      heartbeatMinuteSlot,
-      diffMs,
-      diffSeconds,
-      thresholdMs: HEARTBEAT_TIMEOUT_MS,
-      heartbeatRecheck,
-      fallbackHourKey: hourKey,
-      fallbackLock: existingLock,
-    };
-  }
-
-  let fallbackLock = null;
-  try {
-    fallbackLock = await saveFallbackHourLock(env, hourKey, {
-      source: "worker2",
-      mode: options.manual ? "manual" : "scheduled",
-      hourKey,
-      at: nowIso,
-      beijing_time: beijingHMS(),
-      heartbeatTs,
-      heartbeatMinuteSlot,
-      diffMs,
-      diffSeconds,
-    });
-  } catch (e) {
-    const notification = await sendFeishuText(
-      env,
-      [
-        "worker2 告警：无法写入兜底小时锁 KV，已跳过兜底。",
-        `错误: ${e.message || String(e)}`,
-        `北京时间: ${beijingHMS()}`,
-        `小时锁: ${hourKey}`,
-      ].join("\n")
-    );
-    return {
-      ok: false,
-      mode: "fallback_lock_write_failed",
-      manual: !!options.manual,
-      skipped: true,
-      reason: e.message || String(e),
-      now: nowIso,
-      beijing_time: beijingHMS(),
-      heartbeatKey: HEARTBEAT_LAST_TS_KEY,
-      heartbeatMinuteKey: HEARTBEAT_LAST_MINUTE_KEY,
-      heartbeatTs,
-      heartbeatMinuteSlot,
-      diffMs,
-      diffSeconds,
-      thresholdMs: HEARTBEAT_TIMEOUT_MS,
-      heartbeatRecheck,
-      fallbackHourKey: hourKey,
-      notification,
+      fallbackDate,
     };
   }
 
@@ -904,7 +885,7 @@ async function runWatchdog(env, options = {}) {
       `复查等待: ${Math.floor(HEARTBEAT_CONFIRM_DELAY_MS / 1000)} 秒`,
       heartbeatRecheck?.error ? `复查错误: ${heartbeatRecheck.error}` : "",
       `北京时间: ${beijingHMS()}`,
-      `小时锁: ${hourKey}`,
+      `兜底日期: ${fallbackDate}`,
     ].filter(Boolean).join("\n")
   );
 
@@ -934,7 +915,7 @@ async function runWatchdog(env, options = {}) {
       `复查等待: ${Math.floor(HEARTBEAT_CONFIRM_DELAY_MS / 1000)} 秒`,
       heartbeatRecheck?.error ? `复查错误: ${heartbeatRecheck.error}` : "",
       `北京时间: ${beijingHMS()}`,
-      `小时锁: ${hourKey}`,
+      `兜底日期: ${fallbackDate}`,
       fallbackError ? `兜底执行错误: ${fallbackError}` : "",
       ],
       fallback
@@ -955,8 +936,7 @@ async function runWatchdog(env, options = {}) {
       diffSeconds,
       thresholdMs: HEARTBEAT_TIMEOUT_MS,
       heartbeatRecheck,
-      fallbackHourKey: hourKey,
-      fallbackLock,
+      fallbackDate,
       preNotification,
       fallback,
       fallbackError,
@@ -1052,6 +1032,8 @@ async function buildWorker2Status(env) {
     isHeartbeatSlotHealthy(heartbeat.heartbeatMinuteSlot, nowMs) ||
     isHeartbeatFreshByTimestamp(heartbeat.heartbeatTs, diffMs)
   );
+  const matchedCronLines = getMatchedBeijingCronLines(settings.beijingCrons, nowMs);
+  const nextCronOccurrence = getNextBeijingCronOccurrence(settings.beijingCrons, nowMs);
 
   try {
     dueSchools = (await getDueSchools(env)).map(school => ({
@@ -1099,13 +1081,16 @@ async function buildWorker2Status(env) {
     diffSeconds: diffMs === null ? null : Math.floor(diffMs / 1000),
     thresholdMs: HEARTBEAT_TIMEOUT_MS,
     isStale,
-    scheduleActive: matchesWorker2Schedule(settings, nowMs),
+    scheduleActive: matchedCronLines.length > 0,
     dueSchools,
     dueSchoolsError,
     cron: {
       deployedUtc: WORKER2_DEPLOYED_UTC_CRONS,
       beijing: settings.beijingCrons,
       defaults: DEFAULT_WORKER2_BEIJING_CRONS,
+      updatedAt: settings.updatedAt || "",
+      matchedNow: matchedCronLines,
+      next: nextCronOccurrence,
     },
     todaySummary: {
       total: todayRecords.length,
@@ -1483,7 +1468,8 @@ function worker2UiHtml() {
         <div class="panel">
           <h2>检测时间</h2>
           <textarea id="cronInput" spellcheck="false"></textarea>
-          <p class="small">每行一个北京时间 cron，只支持“分钟 小时 * * *”。例如 54-57 5-21 * * *。</p>
+          <p class="small">每行一个北京时间 cron，只支持“分钟 小时 * * *”。保存后只对未来的分钟生效，今天已经过去的时间段不会补跑；如果需要现在立刻检查，请点“立即检测”。</p>
+          <p class="small" id="cronMeta">-</p>
           <div class="row">
             <button id="saveCronBtn">保存时间</button>
             <button class="secondary" id="resetCronBtn">恢复默认</button>
@@ -1559,11 +1545,8 @@ function worker2UiHtml() {
       if (mode === "healthy_after_recheck") return "复查成功";
       if (mode === "stale") return "异常，已兜底";
       if (mode === "stale_no_due_school") return "异常，无到点学校";
-      if (mode === "stale_locked") return "异常，小时锁跳过";
       if (mode === "kv_unreachable") return "KV 读取失败";
       if (mode === "due_schools_unreachable") return "学校列表失败";
-      if (mode === "fallback_lock_unreachable") return "小时锁读取失败";
-      if (mode === "fallback_lock_write_failed") return "小时锁写入失败";
       if (mode === "disabled") return "已关闭";
       if (mode === "outside_schedule") return "非检测时间";
       return mode || "-";
@@ -1588,7 +1571,7 @@ function worker2UiHtml() {
         var mode = result && result.mode || "";
         if (mode === "healthy" || mode === "healthy_after_recheck") status = "success";
         else if (mode === "stale") status = "stale";
-        else if (mode === "kv_unreachable" || mode === "due_schools_unreachable" || mode === "fallback_lock_unreachable" || mode === "fallback_lock_write_failed") status = "attention";
+        else if (mode === "kv_unreachable" || mode === "due_schools_unreachable") status = "attention";
         else status = "skipped";
       }
       if (status === "stale") return '<span class="pill warn">心跳异常</span>';
@@ -1633,6 +1616,28 @@ function worker2UiHtml() {
       };
     }
 
+    function formatBeijingIso(isoText) {
+      var parsed = Date.parse(isoText || "");
+      if (!Number.isFinite(parsed)) return "";
+      var value = formatClock(parsed + 8 * 3600 * 1000);
+      return value.date + " " + value.time;
+    }
+
+    function nextCronText(cron) {
+      if (!cron || !cron.next) return "暂无";
+      return cron.next.beijing_date + " " + cron.next.beijing_time + "（" + text(cron.next.line) + "）";
+    }
+
+    function cronMetaText(data) {
+      var items = [];
+      var updatedAt = formatBeijingIso(data && data.cron && data.cron.updatedAt);
+      var matchedNow = data && data.cron && Array.isArray(data.cron.matchedNow) ? data.cron.matchedNow : [];
+      if (updatedAt) items.push("最后保存 " + updatedAt);
+      items.push(matchedNow.length ? "当前命中 " + matchedNow.join("；") : "当前未命中检测窗口");
+      items.push("下一次 " + nextCronText(data && data.cron));
+      return items.join("；");
+    }
+
     function syncClock(data) {
       var parsed = Date.parse(data.now || "");
       if (!Number.isFinite(parsed)) return;
@@ -1669,6 +1674,7 @@ function worker2UiHtml() {
       document.getElementById("todayCount").innerHTML = text(data.todaySummary && data.todaySummary.total) + '<div class="small">兜底 ' + text(data.todaySummary && data.todaySummary.fallback) + '，关注 ' + text(data.todaySummary && data.todaySummary.attention) + '</div>';
       document.getElementById("recordDate").value = data.beijing_date;
       document.getElementById("cronInput").value = data.cron && data.cron.beijing ? data.cron.beijing.join("\\n") : "";
+      document.getElementById("cronMeta").textContent = cronMetaText(data);
 
       var dueRows = document.getElementById("dueRows");
       if (!data.dueSchools || data.dueSchools.length === 0) {
@@ -1707,7 +1713,14 @@ function worker2UiHtml() {
       try {
         await api("/api/settings", { method: "POST", body: { beijingCrons: lines } });
         await refresh();
-        document.getElementById("controlMsg").textContent = "时间已保存";
+        var message = "时间已保存";
+        if (statusCache && statusCache.cron && statusCache.cron.next) {
+          message += "，下一次会在 " + nextCronText(statusCache.cron) + " 生效";
+          if (statusCache.cron.next.beijing_date && statusCache.cron.next.beijing_date !== statusCache.beijing_date) {
+            message += "，今天这个时间段已经过去，不会补跑";
+          }
+        }
+        document.getElementById("controlMsg").textContent = message;
       } catch (e) {
         document.getElementById("controlMsg").textContent = e.message || String(e);
       }
@@ -1796,7 +1809,7 @@ function worker2UiHtml() {
           '<div class="detail-item"><strong>心跳槽位</strong>' + esc(result.heartbeatMinuteSlot) + '</div>' +
           '<div class="detail-item"><strong>心跳延迟</strong>' + esc(result.diffSeconds) + ' 秒 / 阈值 ' + esc(result.thresholdSeconds) + ' 秒</div>' +
           '<div class="detail-item"><strong>复查结果</strong>' + (recheck.heartbeatMinuteSlot ? esc(recheck.heartbeatMinuteSlot) + '，等待 ' + esc(Math.floor((recheck.delayMs || 0) / 1000)) + ' 秒' : '-') + '</div>' +
-          '<div class="detail-item"><strong>小时锁</strong>' + esc(result.fallbackHourKey) + '</div>' +
+          '<div class="detail-item"><strong>兜底日期</strong>' + esc(result.fallbackDate) + '</div>' +
           '<div class="detail-item"><strong>到点学校</strong>' + esc(result.dueCount || 0) + '</div>' +
           '<div class="detail-item"><strong>兜底统计</strong>成功 ' + esc(result.fallbackSummary && result.fallbackSummary.ok || 0) + '，跳过 ' + esc(result.fallbackSummary && result.fallbackSummary.skipped || 0) + '，失败 ' + esc(result.fallbackSummary && result.fallbackSummary.fail || 0) + '</div>' +
         '</div>' +

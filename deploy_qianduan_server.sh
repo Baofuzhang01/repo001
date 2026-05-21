@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/termius_server_ed25519}"
-DEFAULT_DEPLOY_HOSTS="ubuntu@82.156.80.161 ubuntu@62.234.188.36 root@101.43.25.136"
+DEFAULT_DEPLOY_HOSTS="ubuntu@82.156.80.161 ubuntu@62.234.188.36 root@101.43.25.136 ubuntu@159.75.99.103 ubuntu@101.42.141.248"
 DEPLOY_HOSTS_TEXT="${DEPLOY_HOSTS:-${DEPLOY_HOST:-$DEFAULT_DEPLOY_HOSTS}}"
 REMOTE_PROJECT_DIR="${REMOTE_PROJECT_DIR:-/opt/Main_ChaoXingReserveSeat}"
 REMOTE_STATIC_DIR="${REMOTE_STATIC_DIR:-/usr/share/nginx/seat_qianduan}"

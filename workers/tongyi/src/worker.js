@@ -49,6 +49,11 @@ function beijingHHMM() {
   return `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
 }
 
+function beijingSecondsOfDay() {
+  const d = beijingNow();
+  return d.getUTCHours() * 3600 + d.getUTCMinutes() * 60 + d.getUTCSeconds();
+}
+
 function beijingDate() {
   const d = beijingNow();
   const y = d.getUTCFullYear();
@@ -60,6 +65,19 @@ function beijingDate() {
 function beijingDayOfWeek() {
   const days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
   return days[beijingNow().getUTCDay()];
+}
+
+function beijingDateFromTimestamp(timestampMs = Date.now()) {
+  const d = new Date(timestampMs + 8 * 3600 * 1000);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function beijingDayOfWeekFromTimestamp(timestampMs = Date.now()) {
+  const days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  return days[new Date(timestampMs + 8 * 3600 * 1000).getUTCDay()];
 }
 
 function beijingDateHour() {
@@ -121,6 +139,7 @@ function normalizeEndtimeHms(value) {
 }
 
 const FORMAL_TIME_WINDOW_LIMIT_SECONDS = 30 * 60;
+const SECONDS_PER_DAY = 24 * 60 * 60;
 
 function parseTriggerTimeSeconds(value) {
   const text = String(value || "").trim();
@@ -141,6 +160,20 @@ function parseEndtimeSeconds(value) {
   return hour * 3600 + minute * 60 + second;
 }
 
+function getFormalTimeWindowDurationSeconds(startSeconds, endSeconds) {
+  if (startSeconds === null || endSeconds === null) return null;
+  if (endSeconds === startSeconds) return 0;
+  return endSeconds > startSeconds
+    ? endSeconds - startSeconds
+    : endSeconds + SECONDS_PER_DAY - startSeconds;
+}
+
+function isFormalTimeWindowCrossMidnight(triggerTime, endtime) {
+  const startSeconds = parseTriggerTimeSeconds(triggerTime);
+  const endSeconds = parseEndtimeSeconds(endtime);
+  return startSeconds !== null && endSeconds !== null && endSeconds < startSeconds;
+}
+
 function validateFormalTimeWindow(triggerTime, endtime) {
   const startSeconds = parseTriggerTimeSeconds(triggerTime);
   if (startSeconds === null) return "正式开始时间格式应为 HH:MM";
@@ -148,7 +181,7 @@ function validateFormalTimeWindow(triggerTime, endtime) {
   const endSeconds = parseEndtimeSeconds(endtime);
   if (endSeconds === null) return "正式截止时间格式应为 HH:MM:SS";
 
-  const durationSeconds = endSeconds - startSeconds;
+  const durationSeconds = getFormalTimeWindowDurationSeconds(startSeconds, endSeconds);
   if (durationSeconds <= 0) return "正式截止时间必须晚于正式开始时间";
   if (durationSeconds > FORMAL_TIME_WINDOW_LIMIT_SECONDS) {
     return "正式开始时间和截止时间间隔不能超过 30 分钟";
@@ -156,12 +189,42 @@ function validateFormalTimeWindow(triggerTime, endtime) {
   return "";
 }
 
+function shouldScheduledTriggerSchool(school, nowSeconds = beijingSecondsOfDay()) {
+  const triggerSeconds = parseTriggerTimeSeconds(school?.trigger_time);
+  if (triggerSeconds === null) return false;
+
+  const endSeconds = parseEndtimeSeconds(school?.endtime);
+  if (endSeconds === null) return true;
+
+  if (endSeconds < triggerSeconds) {
+    return nowSeconds >= triggerSeconds || nowSeconds <= endSeconds;
+  }
+  return nowSeconds >= triggerSeconds && nowSeconds <= endSeconds;
+}
+
+function getActiveScheduleContextForSchool(school, nowSeconds = beijingSecondsOfDay(), timestampMs = Date.now()) {
+  if (isFormalTimeWindowCrossMidnight(school?.trigger_time, school?.endtime)) {
+    const triggerSeconds = parseTriggerTimeSeconds(school?.trigger_time);
+    if (triggerSeconds !== null && nowSeconds >= triggerSeconds) {
+      const nextTimestampMs = timestampMs + 24 * 60 * 60 * 1000;
+      return {
+        day: beijingDayOfWeekFromTimestamp(nextTimestampMs),
+        date: beijingDateFromTimestamp(nextTimestampMs),
+      };
+    }
+  }
+  return {
+    day: beijingDayOfWeekFromTimestamp(timestampMs),
+    date: beijingDateFromTimestamp(timestampMs),
+  };
+}
+
 function parseTriggerTimeMinutes(value) {
   const text = String(value || "").trim();
-  const match = text.match(/^(\d{1,2}):(\d{2})$/);
-  if (!match) return Number.MAX_SAFE_INTEGER;
-  const hour = parseInt(match[1], 10);
-  const minute = parseInt(match[2], 10);
+  const parts = text.match(/\d{1,2}/g);
+  if (!parts || parts.length < 2) return Number.MAX_SAFE_INTEGER;
+  const hour = parseInt(parts[0], 10);
+  const minute = parseInt(parts[1], 10);
   if (Number.isNaN(hour) || Number.isNaN(minute)) return Number.MAX_SAFE_INTEGER;
   if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return Number.MAX_SAFE_INTEGER;
   return hour * 60 + minute;
@@ -192,6 +255,10 @@ function getSchoolConflictGroup(school) {
   if (fidEnc) return `fid:${fidEnc}`;
 
   return normalizeConflictGroup(school?.name);
+}
+
+function shouldCheckSeatConflicts(school) {
+  return Boolean(normalizeConflictGroup(school?.fidEnc));
 }
 
 const GITHUB_TOKEN_BINDINGS = {
@@ -486,6 +553,66 @@ async function deleteUser(KV, schoolId, userId) {
   ]);
 }
 
+async function migrateUserToSchool(KV, sourceSchoolId, userId, targetSchoolId) {
+  if (!targetSchoolId) {
+    return { error: "请填写目标组 ID", status: 400 };
+  }
+  if (sourceSchoolId === targetSchoolId) {
+    return { error: "目标组不能和当前组相同", status: 400 };
+  }
+
+  const [sourceSchool, targetSchool, user] = await Promise.all([
+    getSchool(KV, sourceSchoolId),
+    getSchool(KV, targetSchoolId),
+    getUser(KV, sourceSchoolId, userId),
+  ]);
+  if (!sourceSchool) return { error: "Source school not found", status: 404 };
+  if (!targetSchool) return { error: "目标组不存在", status: 404 };
+  if (!user) return { error: "User not found", status: 404 };
+
+  const existingTargetUser = await getUser(KV, targetSchoolId, userId);
+  if (existingTargetUser) {
+    return { error: "目标组已存在相同 ID 的用户", status: 409 };
+  }
+
+  const targetUsers = await getConflictScopeUsers(KV, targetSchoolId, targetSchool);
+  const conflicts = await findSeatConflicts(
+    KV,
+    targetSchoolId,
+    user.schedule || {},
+    { userId, phone: user.phone },
+    targetUsers,
+  );
+  if (conflicts.length > 0) {
+    return {
+      error: buildSeatConflictError(conflicts),
+      conflicts,
+      status: 409,
+    };
+  }
+
+  const targetUserIds = await getSchoolUsers(KV, targetSchoolId);
+  await saveUser(KV, targetSchoolId, user);
+  if (!targetUserIds.includes(userId)) {
+    targetUserIds.push(userId);
+    await saveSchoolUsers(KV, targetSchoolId, targetUserIds);
+  }
+  await deleteUser(KV, sourceSchoolId, userId);
+
+  const sourceUserIds = await getSchoolUsers(KV, sourceSchoolId);
+  await Promise.all([
+    setSchoolUserCountInSnapshot(KV, sourceSchoolId, sourceUserIds.length),
+    setSchoolUserCountInSnapshot(KV, targetSchoolId, targetUserIds.length),
+  ]);
+
+  return {
+    ok: true,
+    user: { ...user, password: user.password ? "******" : "" },
+    sourceSchool: sanitizeSchoolForClient(sourceSchool),
+    targetSchool: sanitizeSchoolForClient(targetSchool),
+  };
+}
+
 function minuteBucket(timestampMs) {
   return Math.floor(timestampMs / 60000);
 }
@@ -531,6 +658,10 @@ async function getFallbackTriggerRecord(KV, date, schoolId) {
   return raw ? JSON.parse(raw) : null;
 }
 
+function isScheduledTriggerRecord(record) {
+  return !!record && record.mode === "scheduled";
+}
+
 async function saveFallbackTriggerRecord(KV, date, schoolId, record) {
   await KV.put(
     buildFallbackTriggerKey(date, schoolId),
@@ -571,13 +702,19 @@ function defaultSchool(id, name) {
       mode: "C",
       submit_mode: "serial",
       login_lead_seconds: 18,
+      login_lead_seconds_range: [18, 18],
       slider_lead_seconds: 10,
+      slider_lead_seconds_range: [10, 10],
       fast_probe_start_offset_ms: 14,
       fast_probe_start_range_ms: [14, 14],
       warm_connection_lead_ms: 2400,
       pre_fetch_token_ms: 1531,
+      pre_fetch_token_range_ms: [1531, 1531],
       first_submit_offset_ms: 9,
+      first_submit_offset_range_ms: [9, 9],
       token_fetch_delay_ms: 45,
+      token_fetch_timeout_ms: 2830,
+      fast_probe_timeout_ms: 2830,
       first_token_date_mode: "submit_date",
     },
   };
@@ -614,7 +751,9 @@ function getEnabledScheduleSlots(daySchedule) {
         seatPageId: daySchedule.seatPageId || "",
         fidEnc: daySchedule.fidEnc || "",
       }];
-  return rawSlots.filter(slot => slot && slot.times && slot.roomid);
+  return rawSlots
+    .map((slot, index) => slot && typeof slot === "object" ? { ...slot, __slotIndex: index } : slot)
+    .filter(slot => slot && slot.times && slot.roomid);
 }
 
 // ─── GitHub Dispatch ───
@@ -825,6 +964,34 @@ function randIntInclusive(min, max) {
   return Math.floor(Math.random() * (hi - lo + 1)) + lo;
 }
 
+function randIntUniqueInclusive(min, max, usedValues) {
+  const lo = Math.min(min, max);
+  const hi = Math.max(min, max);
+  const capacity = hi - lo + 1;
+  const usedInRange = usedValues instanceof Set
+    ? [...usedValues].filter(v => v >= lo && v <= hi).length
+    : 0;
+  if (!(usedValues instanceof Set) || usedInRange >= capacity) {
+    return randIntInclusive(lo, hi);
+  }
+
+  for (let i = 0; i < 12; i++) {
+    const candidate = randIntInclusive(lo, hi);
+    if (!usedValues.has(candidate)) {
+      usedValues.add(candidate);
+      return candidate;
+    }
+  }
+
+  for (let candidate = lo; candidate <= hi; candidate++) {
+    if (!usedValues.has(candidate)) {
+      usedValues.add(candidate);
+      return candidate;
+    }
+  }
+  return randIntInclusive(lo, hi);
+}
+
 function parseRangeWithFallback(v, fallback) {
   if (Array.isArray(v) && v.length >= 2) {
     const a = parseInt(v[0], 10);
@@ -840,14 +1007,50 @@ function parseRangeWithFallback(v, fallback) {
   return [fallback, fallback];
 }
 
-function randomizeStrategy(base) {
+function randomizeStrategy(base, options = {}) {
   const s = { ...(base || {}) };
+  const loginLeadRange = parseRangeWithFallback(
+    s.login_lead_seconds_range,
+    s.login_lead_seconds || 18,
+  );
+  const sliderLeadRange = parseRangeWithFallback(
+    s.slider_lead_seconds_range,
+    s.slider_lead_seconds || 10,
+  );
   const probeStartRange = parseRangeWithFallback(
     s.fast_probe_start_range_ms,
     s.fast_probe_start_offset_ms || 14,
   );
+  const firstSubmitRange = parseRangeWithFallback(
+    s.first_submit_offset_range_ms,
+    s.first_submit_offset_ms || 9,
+  );
+  const preFetchTokenRange = parseRangeWithFallback(
+    s.pre_fetch_token_range_ms,
+    s.pre_fetch_token_ms || 1531,
+  );
 
+  s.login_lead_seconds = randIntUniqueInclusive(
+    loginLeadRange[0],
+    loginLeadRange[1],
+    options.loginLeadUsedValues,
+  );
+  s.slider_lead_seconds = randIntUniqueInclusive(
+    sliderLeadRange[0],
+    sliderLeadRange[1],
+    options.sliderLeadUsedValues,
+  );
   s.fast_probe_start_offset_ms = randIntInclusive(probeStartRange[0], probeStartRange[1]);
+  s.pre_fetch_token_ms = randIntUniqueInclusive(
+    preFetchTokenRange[0],
+    preFetchTokenRange[1],
+    options.preFetchTokenUsedValues,
+  );
+  s.first_submit_offset_ms = randIntUniqueInclusive(
+    firstSubmitRange[0],
+    firstSubmitRange[1],
+    options.firstSubmitUsedValues,
+  );
   delete s.burst_offsets_ms;
   delete s.burst_jitter_range_ms;
   return s;
@@ -883,7 +1086,10 @@ function buildDispatchPayloadForUser(env, school, user, options = {}) {
     ...(reserveDayOffset !== null ? { reserve_day_offset: reserveDayOffset } : {}),
     enable_slider: !!school.enable_slider,
     enable_textclick: !!school.enable_textclick,
-    strategy: randomizeStrategy(school.strategy),
+    strategy: randomizeStrategy(school.strategy, {
+      preFetchTokenUsedValues: options.preFetchTokenUsedValues,
+      firstSubmitUsedValues: options.firstSubmitUsedValues,
+    }),
   };
 }
 
@@ -895,7 +1101,7 @@ function chunkArray(arr, size) {
   return chunks;
 }
 
-async function buildTodayDispatchUsers(KV, schoolId, school, today, schoolUsers = null) {
+async function buildTodayDispatchUsers(KV, schoolId, school, today, schoolUsers = null, dateText = "") {
   const sourceUsers = Array.isArray(schoolUsers) ? schoolUsers : await getSchoolUsersSnapshot(KV, schoolId);
   const users = [];
   for (const user of sourceUsers) {
@@ -910,13 +1116,18 @@ async function buildTodayDispatchUsers(KV, schoolId, school, today, schoolUsers 
       password: user.password,
       remark: user.remark || user.username || user.phone,
       nickname: user.username,
-      slots: activeSlots.map(s => ({
+      slots: activeSlots.map((s, slotIndex) => {
+        const originalSlotIndex = Number.isInteger(s.__slotIndex) ? s.__slotIndex : slotIndex;
+        return {
         roomid: s.roomid,
         seatid: (s.seatid || "").split(",").map(x => x.trim()).filter(Boolean),
         times: s.times,
         seatPageId: s.seatPageId || "",
         fidEnc: school?.fidEnc || s.fidEnc || "",
-      })),
+        backupSeats: typeof s.backupSeats === "string" ? s.backupSeats : "",
+        backupSlots: Array.isArray(s.backupSlots) ? s.backupSlots : [],
+      };
+      }),
     });
   }
   return users;
@@ -935,6 +1146,10 @@ async function dispatchUsersInBatches(env, school, users, options = {}) {
   const batchSize = dispatchTarget === "server_relay" ? serverMaxConcurrency : BATCH_SIZE;
   const batches = chunkArray(users, batchSize);
   const reserveDayOffset = resolveReserveDayOffset(env, school);
+  const loginLeadUsedValues = new Set();
+  const sliderLeadUsedValues = new Set();
+  const preFetchTokenUsedValues = new Set();
+  const firstSubmitUsedValues = new Set();
   let okBatches = 0;
   const dispatchErrors = [];
 
@@ -959,6 +1174,10 @@ async function dispatchUsersInBatches(env, school, users, options = {}) {
       ...(reserveDayOffset !== null ? { reserve_day_offset: reserveDayOffset } : {}),
       users: batches[i].map(u => buildDispatchPayloadForUser(env, school, u, {
         allowTestEndtimeOverride: options.allowTestEndtimeOverride === true,
+        loginLeadUsedValues,
+        sliderLeadUsedValues,
+        preFetchTokenUsedValues,
+        firstSubmitUsedValues,
       })),
       ...(dispatchTarget === "server_relay" ? {
         server_url: serverUrl,
@@ -1173,6 +1392,7 @@ function dayNameZh(day) {
 async function getConflictScopeUsers(KV, schoolId, school = null) {
   const targetSchool = school || await getSchool(KV, schoolId);
   if (!targetSchool) return [];
+  if (!shouldCheckSeatConflicts(targetSchool)) return [];
 
   const schools = await getSchoolsSnapshot(KV);
   const targetGroup = getSchoolConflictGroup(targetSchool);
@@ -1288,21 +1508,52 @@ function buildSeatConflictError(conflicts) {
 // ─── Scheduled Handler ───
 
 async function handleScheduled(env) {
-  const now = beijingHHMM();
-  const today = beijingDayOfWeek();
+  const nowSeconds = beijingSecondsOfDay();
+  const nowTimestampMs = Date.now();
   const schools = await getSchoolsSnapshot(env.SEAT_KV);
 
   for (const school of schools) {
-    if (!school || school.trigger_time !== now) continue;
+    if (!school || !shouldScheduledTriggerSchool(school, nowSeconds)) continue;
+    const scheduleContext = getActiveScheduleContextForSchool(school, nowSeconds, nowTimestampMs);
+    const today = scheduleContext.day;
+    const todayDate = scheduleContext.date;
 
-    const users = await buildTodayDispatchUsers(env.SEAT_KV, school.id, school, today);
-    if (users.length === 0) continue;
+    const existingRecord = await getFallbackTriggerRecord(env.SEAT_KV, todayDate, school.id);
+    if (isScheduledTriggerRecord(existingRecord)) continue;
+
+    const users = await buildTodayDispatchUsers(env.SEAT_KV, school.id, school, today, null, todayDate);
+    if (users.length === 0) {
+      await saveFallbackTriggerRecord(env.SEAT_KV, todayDate, school.id, {
+        source: "tongyi",
+        mode: "scheduled",
+        at: new Date().toISOString(),
+        beijing_time: beijingHHMM(),
+        schoolId: school.id,
+        schoolName: school.name,
+        triggeredUsers: 0,
+        okBatches: 0,
+        totalBatches: 0,
+      });
+      continue;
+    }
     const result = await dispatchUsersInBatches(env, school, users, {
       allowTestEndtimeOverride: false,
     });
     if (result.error) {
       console.log(`Scheduled dispatch school ${school.id} failed: ${result.error}`);
+      continue;
     }
+    await saveFallbackTriggerRecord(env.SEAT_KV, todayDate, school.id, {
+      source: "tongyi",
+      mode: "scheduled",
+      at: new Date().toISOString(),
+      beijing_time: beijingHHMM(),
+      schoolId: school.id,
+      schoolName: school.name,
+      triggeredUsers: users.length,
+      okBatches: result.okBatches,
+      totalBatches: result.totalBatches,
+    });
     console.log(
       `Scheduled dispatch school ${school.id}: users=${users.length}, batches=${result.okBatches}/${result.totalBatches}`
     );
@@ -1600,6 +1851,19 @@ async function handleAPI(request, env, path) {
     return jsonResp({ ok: true, user: { ...user, password: "******" } });
   }
 
+  // POST /api/school/:id/user/:userId/migrate
+  const migrateUserMatch = path.match(/^\/api\/school\/([^/]+)\/user\/([^/]+)\/migrate$/);
+  if (method === "POST" && migrateUserMatch) {
+    const [_, schoolId, userId] = migrateUserMatch;
+    const body = await request.json();
+    const targetSchoolId = String(body.target_school_id || body.targetSchoolId || "").trim();
+    const result = await migrateUserToSchool(KV, schoolId, userId, targetSchoolId);
+    if (result.error) {
+      return jsonResp(result, result.status || 400);
+    }
+    return jsonResp(result);
+  }
+
   // DELETE /api/school/:id/user/:userId
   if (method === "DELETE" && userMatch) {
     const schoolId = userMatch[1];
@@ -1638,21 +1902,64 @@ async function handleAPI(request, env, path) {
     return jsonResp({ ok: true, status: user.status });
   }
 
+  // POST /api/school/:id/users/status
+  const bulkUserStatusMatch = path.match(/^\/api\/school\/([^/]+)\/users\/status$/);
+  if (method === "POST" && bulkUserStatusMatch) {
+    const schoolId = bulkUserStatusMatch[1];
+    const school = await getSchool(KV, schoolId);
+    if (!school) return jsonResp({ error: "School not found" }, 404);
+
+    const body = await request.json();
+    const nextStatus = String(body.status || "").trim();
+    if (nextStatus !== "active" && nextStatus !== "paused") {
+      return jsonResp({ error: "status must be active or paused" }, 400);
+    }
+
+    const userIds = await getSchoolUsers(KV, schoolId);
+    let updated = 0;
+    let unchanged = 0;
+    let missing = 0;
+    for (const userId of userIds) {
+      const user = await getUser(KV, schoolId, userId);
+      if (!user) {
+        missing += 1;
+        continue;
+      }
+      if (user.status === nextStatus) {
+        unchanged += 1;
+        continue;
+      }
+      user.status = nextStatus;
+      await saveUser(KV, schoolId, user);
+      updated += 1;
+    }
+
+    return jsonResp({
+      ok: true,
+      status: nextStatus,
+      total: userIds.length,
+      updated,
+      unchanged,
+      missing,
+    });
+  }
+
   // POST /api/trigger/:schoolId
   const triggerSchoolMatch = path.match(/^\/api\/trigger\/([^/]+)$/);
   if (method === "POST" && triggerSchoolMatch) {
     const schoolId = triggerSchoolMatch[1];
     const school = await getSchool(KV, schoolId);
     if (!school) return jsonResp({ error: "School not found" }, 404);
-    const today = beijingDayOfWeek();
-    const todayDate = beijingDate();
+    const scheduleContext = getActiveScheduleContextForSchool(school);
+    const today = scheduleContext.day;
+    const todayDate = scheduleContext.date;
     const triggerSource = (request.headers.get("X-Trigger-Source") || "").trim();
     const fallbackMode = (request.headers.get("X-Fallback-Mode") || "").trim();
     const isScheduledFallback = triggerSource === "worker2" && fallbackMode === "scheduled";
 
     if (isScheduledFallback) {
       const existingRecord = await getFallbackTriggerRecord(KV, todayDate, schoolId);
-      if (existingRecord) {
+      if (isScheduledTriggerRecord(existingRecord)) {
         return jsonResp({
           ok: true,
           skipped: true,
@@ -1665,7 +1972,7 @@ async function handleAPI(request, env, path) {
       }
     }
 
-    const users = await buildTodayDispatchUsers(KV, schoolId, school, today);
+    const users = await buildTodayDispatchUsers(KV, schoolId, school, today, null, todayDate);
     if (users.length === 0) {
       if (isScheduledFallback) {
         await saveFallbackTriggerRecord(KV, todayDate, schoolId, {
@@ -1722,7 +2029,9 @@ async function handleAPI(request, env, path) {
     const school = await getSchool(KV, schoolId);
     const user = await getUser(KV, schoolId, userId);
     if (!school || !user) return jsonResp({ error: "Not found" }, 404);
-    const today = beijingDayOfWeek();
+    const scheduleContext = getActiveScheduleContextForSchool(school);
+    const today = scheduleContext.day;
+    const todayDate = scheduleContext.date;
     const daySchedule = user.schedule[today];
     if (!daySchedule || !daySchedule.enabled) {
       return jsonResp({ error: "User has no schedule for today" }, 400);
@@ -1730,7 +2039,9 @@ async function handleAPI(request, env, path) {
     const rawSlots = daySchedule.slots
       ? daySchedule.slots
       : [{ roomid: daySchedule.roomid, seatid: daySchedule.seatid, times: daySchedule.times, seatPageId: daySchedule.seatPageId || "", fidEnc: daySchedule.fidEnc || "" }];
-    const activeSlots = rawSlots.filter(s => s.times && s.roomid);
+    const activeSlots = rawSlots
+      .map((slot, index) => slot && typeof slot === "object" ? { ...slot, __slotIndex: index } : slot)
+      .filter(s => s.times && s.roomid);
     if (activeSlots.length === 0) return jsonResp({ error: "No active slots for today" }, 400);
     const reserveDayOffset = resolveReserveDayOffset(env, school);
     const dispatchUser = {
@@ -1739,13 +2050,17 @@ async function handleAPI(request, env, path) {
       remark: user.remark || user.username || user.phone,
       nickname: user.username,
       ...(reserveDayOffset !== null ? { reserve_day_offset: reserveDayOffset } : {}),
-      slots: activeSlots.map(s => ({
+      slots: activeSlots.map((s, slotIndex) => {
+        const originalSlotIndex = Number.isInteger(s.__slotIndex) ? s.__slotIndex : slotIndex;
+        return {
         roomid: s.roomid,
         seatid: (s.seatid || "").split(",").map(x => x.trim()).filter(Boolean),
         times: s.times,
         seatPageId: s.seatPageId || "",
         fidEnc: school.fidEnc || s.fidEnc || "",
-      })),
+        backupSeats: typeof s.backupSeats === "string" ? s.backupSeats : "",
+      };
+      }),
     };
     const result = await dispatchUsersInBatches(env, school, [dispatchUser], {
       allowTestEndtimeOverride: true,
@@ -1866,7 +2181,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .card{background:#fff;border-radius:12px;padding:20px;margin-bottom:16px;box-shadow:0 2px 8px rgba(0,0,0,0.06)}
 .card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid #f0f0f0}
 .card-title{font-size:18px;font-weight:600;color:#333}
+.card-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:flex-end}
+.school-list{display:flex;flex-direction:column;gap:16px}
 .school-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}
+.school-section + .school-section{border-top:1px solid #e8e8e8;padding-top:16px}
 .school-card{background:#fff;border-radius:12px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,0.06);cursor:pointer;transition:all 0.2s;border:2px solid transparent}
 .school-card:hover{border-color:#667eea;transform:translateY(-2px)}
 .school-card h3{font-size:18px;color:#333;margin-bottom:8px}
@@ -1906,11 +2224,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .schedule-day-fields input{padding:6px;font-size:12px}
 .slot-row{border-top:1px solid #e8e8e8;padding-top:8px;margin-top:8px}
 .slot-label{font-size:11px;color:#888;margin-bottom:4px}
+.backup-seat-list{font-size:12px;color:#555;word-break:break-all;line-height:1.6}
 .global-time-tools{background:#fafafa;border:1px solid #ececec;border-radius:8px;padding:12px;margin:12px 0}
 .global-config-fields{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
 .global-config-fields input{padding:8px;font-size:13px}
 .global-config-actions{display:flex;gap:8px;align-items:center;margin-top:8px}
 .global-time-note{font-size:12px;color:#777;line-height:1.7;margin-top:8px}
+.user-migrate-tools{background:#fafafa;border:1px solid #ececec;border-radius:8px;padding:12px;margin:0 0 16px}
+.user-migrate-row{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:end}
+.user-migrate-note{font-size:12px;color:#777;line-height:1.7;margin-top:8px}
 .toast{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:8px;color:#fff;z-index:2000;animation:slideIn 0.3s}
 .toast-success{background:#52c41a}
 .toast-error{background:#ff4d4f}
@@ -1940,7 +2262,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .mapping-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
 .mapping-note{font-size:12px;color:#777;line-height:1.7;margin-top:10px}
 @media (max-width: 768px){.mapping-inline,.mapping-user-fields{grid-template-columns:1fr}}
-@media (max-width: 768px){.test-override-row,.global-config-fields{grid-template-columns:1fr}.actions,.global-config-actions{flex-wrap:wrap}}
+@media (max-width: 768px){.test-override-row,.global-config-fields,.user-migrate-row{grid-template-columns:1fr}.actions,.global-config-actions,.card-actions{flex-wrap:wrap}}
 </style>
 </head>
 <body>
@@ -1958,8 +2280,10 @@ let currentSchool = null;
 let schools = [];
 let users = [];
 let isSavingUser = false;
+let isMigratingUser = false;
 const ACTIVE_TODAY_CACHE_TTL_MS = 3000;
 const ACTIVE_TODAY_CACHE_PREFIX = "active_today_count:";
+const UI_SORT_VERSION = "group-trigger-time-20260508-2";
 const DEFAULT_READING_ZONE_GROUPS = [
   { floor: "2 楼", zones: [{ id: "13474", name: "西阅览区" }, { id: "13473", name: "东阅览区" }, { id: "13476", name: "西电子阅览区" }, { id: "13472", name: "东电子阅览区" }] },
   { floor: "3 楼", zones: [{ id: "13481", name: "西阅览区" }, { id: "13484", name: "中阅览区" }, { id: "13478", name: "东阅览区" }, { id: "13480", name: "西电子阅览区" }, { id: "13475", name: "东电子阅览区" }] },
@@ -2080,12 +2404,20 @@ function parseClientEndtimeSeconds(value) {
   return hour * 3600 + minute * 60 + second;
 }
 
+function getClientFormalWindowDurationSeconds(startSeconds, endSeconds) {
+  if (startSeconds === null || endSeconds === null) return null;
+  if (endSeconds === startSeconds) return 0;
+  return endSeconds > startSeconds
+    ? endSeconds - startSeconds
+    : endSeconds + 24 * 60 * 60 - startSeconds;
+}
+
 function validateFormalTimeWindowInput(triggerTime, endtime) {
   const startSeconds = parseClientTriggerSeconds(triggerTime);
   if (startSeconds === null) return "正式开始时间格式应为 HH:MM";
   const endSeconds = parseClientEndtimeSeconds(endtime);
   if (endSeconds === null) return "正式截止时间格式应为 HH:MM:SS";
-  const durationSeconds = endSeconds - startSeconds;
+  const durationSeconds = getClientFormalWindowDurationSeconds(startSeconds, endSeconds);
   if (durationSeconds <= 0) return "正式截止时间必须晚于正式开始时间";
   if (durationSeconds > 30 * 60) return "正式开始时间和截止时间间隔不能超过 30 分钟";
   return "";
@@ -2183,7 +2515,7 @@ function normalizeReadingZoneGroups(raw) {
 }
 
 function _emptySlot() {
-  return { roomid: "", seatid: "", times: "", seatPageId: "", fidEnc: "" };
+  return { roomid: "", seatid: "", times: "", seatPageId: "", fidEnc: "", backupSeats: "" };
 }
 
 function normalizePlanExtractTime(value) {
@@ -2410,6 +2742,7 @@ function parseScheduleJsonMapping(rawText) {
     const roomid = String(item.roomid || "").trim();
     const seatPageId = String(item.seatPageId || item.roomid || "").trim();
     const fidEnc = String(item.fidEnc || "").trim();
+    const backupSeats = String(item.backupSeats || "").trim();
 
     const times = normalizeTimesLabel(item.times);
 
@@ -2424,7 +2757,7 @@ function parseScheduleJsonMapping(rawText) {
     for (const day of daysofweek) {
       if (!schedule[day]) continue;
       schedule[day].enabled = true;
-      schedule[day].slots.push({ roomid, seatid, times, seatPageId, fidEnc });
+      schedule[day].slots.push({ roomid, seatid, times, seatPageId, fidEnc, backupSeats });
     }
   }
 
@@ -2449,7 +2782,7 @@ function scheduleToJsonMapping(schedule) {
     if (!dayCfg || !dayCfg.enabled) continue;
     const slots = Array.isArray(dayCfg.slots)
       ? dayCfg.slots
-      : [{ roomid: dayCfg.roomid, seatid: dayCfg.seatid, times: dayCfg.times, seatPageId: dayCfg.seatPageId, fidEnc: dayCfg.fidEnc }];
+      : [{ roomid: dayCfg.roomid, seatid: dayCfg.seatid, times: dayCfg.times, seatPageId: dayCfg.seatPageId, fidEnc: dayCfg.fidEnc, backupSeats: dayCfg.backupSeats }];
     for (const s of slots) {
       if (!s || !s.roomid || !s.times) continue;
       const times = parseTimesInput(s.times);
@@ -2460,6 +2793,7 @@ function scheduleToJsonMapping(schedule) {
         seatid,
         seatPageId: String(s.seatPageId || s.roomid || ""),
         fidEnc: String(s.fidEnc || ""),
+        backupSeats: String(s.backupSeats || ""),
         daysofweek: [day],
       });
     }
@@ -2472,8 +2806,8 @@ function fillScheduleFormFromSchedule(schedule) {
   days.forEach(d => {
     const sch = schedule?.[d] || {};
     document.getElementById("sch_" + d + "_enabled").checked = !!sch.enabled;
-    const slots = sch.slots || [{ roomid: sch.roomid, seatid: sch.seatid, times: sch.times, seatPageId: sch.seatPageId, fidEnc: sch.fidEnc }];
-    const activeCount = slots.filter(s => s && (s.roomid || s.seatid || s.times || s.seatPageId || s.fidEnc)).length;
+    const slots = sch.slots || [{ roomid: sch.roomid, seatid: sch.seatid, times: sch.times, seatPageId: sch.seatPageId, fidEnc: sch.fidEnc, backupSeats: sch.backupSeats }];
+    const activeCount = slots.filter(s => s && (s.roomid || s.seatid || s.times || s.seatPageId || s.fidEnc || s.backupSeats)).length;
     const visibleCount = Math.max(1, Math.min(4, activeCount || 1));
     setVisibleSlotsForDay(d, visibleCount);
     [0,1,2,3].forEach(i => {
@@ -2483,6 +2817,8 @@ function fillScheduleFormFromSchedule(schedule) {
       document.getElementById("sch_" + d + "_s" + i + "_times").value = s.times || "";
       document.getElementById("sch_" + d + "_s" + i + "_seatPageId").value = s.seatPageId || "";
       document.getElementById("sch_" + d + "_s" + i + "_fidEnc").value = s.fidEnc || "";
+      const backupSeats = String(s.backupSeats || "");
+      document.getElementById("sch_" + d + "_s" + i + "_backupSeats").value = backupSeats;
     });
   });
 }
@@ -2499,6 +2835,7 @@ function buildScheduleFromForm() {
       times: document.getElementById("sch_" + d + "_s" + i + "_times").value.trim(),
       seatPageId: document.getElementById("sch_" + d + "_s" + i + "_seatPageId").value.trim(),
       fidEnc: document.getElementById("sch_" + d + "_s" + i + "_fidEnc").value.trim(),
+      backupSeats: document.getElementById("sch_" + d + "_s" + i + "_backupSeats").value.trim(),
     }));
     schedule[d] = {
       enabled: document.getElementById("sch_" + d + "_enabled").checked,
@@ -2514,6 +2851,7 @@ const USER_GLOBAL_SYNC_FIELDS = [
   { key: "times", label: "时间段", inputId: "global_sync_times", normalize: value => normalizeTimesLabel(value) },
   { key: "seatPageId", label: "页面ID", inputId: "global_sync_seatPageId", normalize: value => String(value || "").trim() },
   { key: "fidEnc", label: "fidEnc", inputId: "global_sync_fidEnc", normalize: value => String(value || "").trim() },
+  { key: "backupSeats", label: "备选座位", inputId: "global_sync_backupSeats", normalize: value => String(value || "").trim() },
 ];
 
 function resetUserGlobalSyncInputs() {
@@ -2546,7 +2884,7 @@ function applyUserGlobalConfigSync() {
   days.forEach(d => {
     const visibleCount = getVisibleSlotsForDay(d);
     Array.from({ length: visibleCount }, (_, i) => i).forEach(i => {
-      const slotFields = ["roomid", "seatid", "times", "seatPageId", "fidEnc"].map(key => (
+      const slotFields = ["roomid", "seatid", "times", "seatPageId", "fidEnc", "backupSeats"].map(key => (
         document.getElementById("sch_" + d + "_s" + i + "_" + key)
       ));
       const hasExistingConfig = slotFields.some(el => el && String(el.value || "").trim());
@@ -2715,6 +3053,14 @@ function setUserSavePending(pending) {
   if (!btn) return;
   btn.disabled = pending;
   btn.textContent = pending ? "保存中..." : "保存用户";
+}
+
+function setUserMigratePending(pending) {
+  isMigratingUser = pending;
+  const btn = document.getElementById("migrateUserButton");
+  if (!btn) return;
+  btn.disabled = pending;
+  btn.textContent = pending ? "迁移中..." : "迁移用户";
 }
 
 function escapeHtml(text) {
@@ -2903,10 +3249,10 @@ async function refreshSchoolActiveTodayCounts(force = false) {
 
 function parseTriggerTimeMinutes(value) {
   const text = String(value || "").trim();
-  const match = text.match(/^(\d{1,2}):(\d{2})$/);
-  if (!match) return Number.MAX_SAFE_INTEGER;
-  const hour = parseInt(match[1], 10);
-  const minute = parseInt(match[2], 10);
+  const parts = text.match(/\\d{1,2}/g);
+  if (!parts || parts.length < 2) return Number.MAX_SAFE_INTEGER;
+  const hour = parseInt(parts[0], 10);
+  const minute = parseInt(parts[1], 10);
   if (Number.isNaN(hour) || Number.isNaN(minute)) return Number.MAX_SAFE_INTEGER;
   if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return Number.MAX_SAFE_INTEGER;
   return hour * 60 + minute;
@@ -2921,6 +3267,107 @@ function getSortedSchoolsForDisplay(items) {
       if (timeDiff !== 0) return timeDiff;
       return String(a?.id || "").localeCompare(String(b?.id || ""));
     });
+}
+
+function normalizeClientConflictGroup(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function getClientSchoolConflictGroup(school) {
+  const explicitGroup = normalizeClientConflictGroup(school?.conflict_group);
+  if (explicitGroup) return "group:" + explicitGroup;
+
+  const fidEnc = normalizeClientConflictGroup(school?.fidEnc);
+  if (fidEnc) return "fid:" + fidEnc;
+
+  return normalizeClientConflictGroup(school?.name);
+}
+
+function compareSchoolForDisplay(a, b) {
+  const timeDiff = parseTriggerTimeMinutes(a?.trigger_time) - parseTriggerTimeMinutes(b?.trigger_time);
+  if (timeDiff !== 0) return timeDiff;
+  return String(a?.id || "").localeCompare(String(b?.id || ""));
+}
+
+function compareSchoolByTriggerTime(a, b) {
+  return parseTriggerTimeMinutes(a?.trigger_time) - parseTriggerTimeMinutes(b?.trigger_time);
+}
+
+function buildSchoolDisplaySections(schoolItems) {
+  const sourceSchools = (Array.isArray(schoolItems) ? schoolItems : []).filter(Boolean);
+  const groupCounts = new Map();
+  const largeGroupMap = new Map();
+  const otherSchools = [];
+  for (const school of sourceSchools) {
+    const group = getClientSchoolConflictGroup(school);
+    if (!group) continue;
+    groupCounts.set(group, (groupCounts.get(group) || 0) + 1);
+  }
+
+  for (const school of sourceSchools) {
+    const group = getClientSchoolConflictGroup(school);
+    const isLargeConflictGroup = group && groupCounts.get(group) >= 3;
+    if (isLargeConflictGroup) {
+      if (!largeGroupMap.has(group)) {
+        largeGroupMap.set(group, []);
+      }
+      largeGroupMap.get(group).push(school);
+    } else {
+      otherSchools.push(school);
+    }
+  }
+
+  const sections = Array.from(largeGroupMap.entries()).map(([key, schools]) => ({
+    key,
+    schools: schools.slice().sort(compareSchoolByTriggerTime),
+  }));
+  if (otherSchools.length) {
+    sections.push({
+      key: "other",
+      schools: otherSchools.slice().sort(compareSchoolByTriggerTime),
+    });
+  }
+  return sections;
+}
+
+function renderSchoolCard(s) {
+  return \`
+    <div class="school-card" onclick="openSchool('\${s.id}')">
+      <h3>\${s.name}</h3>
+      <div class="meta">ID: \${s.id} | 仓库: \${s.repo}</div>
+      <div class="stats">
+        <span>\${s.userCount || 0} 名用户</span>
+        <span>\${formatActiveTodayMeta(s.id)}</span>
+        <span>正式开始: \${s.trigger_time}</span>
+      </div>
+    </div>
+  \`;
+}
+
+function renderSchoolList() {
+  if (!schools.length) {
+    return '<div class="empty"><div class="empty-icon">📚</div><p>暂无学校，点击上方按钮添加</p></div>';
+  }
+
+  const sections = buildSchoolDisplaySections(schools);
+  window.__tongyiSortDebug = sections.map(section => ({
+    key: section.key,
+    schools: section.schools.map(s => ({
+      id: s.id,
+      name: s.name,
+      trigger_time: s.trigger_time,
+      sort_minutes: parseTriggerTimeMinutes(s.trigger_time),
+      conflict_group: getClientSchoolConflictGroup(s),
+    })),
+  }));
+
+  return sections.map(section => \`
+    <div class="school-section">
+      <div class="school-grid">
+        \${section.schools.map(renderSchoolCard).join("")}
+      </div>
+    </div>
+  \`).join("");
 }
 
 function upsertSchoolInOrderedList(items, school, options = {}) {
@@ -2948,21 +3395,11 @@ function renderSchools() {
       </div>
       <div class="card">
         <div class="card-header">
-          <span class="card-title">学校列表</span>
+          <span class="card-title">学校列表 <span class="small">排序版: \${UI_SORT_VERSION}</span></span>
           <button class="btn btn-primary" onclick="showAddSchool()">+ 添加学校</button>
         </div>
-        <div class="school-grid">
-          \${schools.length ? schools.map(s => \`
-            <div class="school-card" onclick="openSchool('\${s.id}')">
-              <h3>\${s.name}</h3>
-              <div class="meta">ID: \${s.id} | 仓库: \${s.repo}</div>
-              <div class="stats">
-                <span>\${s.userCount || 0} 名用户</span>
-                <span>\${formatActiveTodayMeta(s.id)}</span>
-                <span>正式开始: \${s.trigger_time}</span>
-              </div>
-            </div>
-          \`).join("") : '<div class="empty"><div class="empty-icon">📚</div><p>暂无学校，点击上方按钮添加</p></div>'}
+        <div class="school-list">
+          \${renderSchoolList()}
         </div>
       </div>
     </div>
@@ -3123,7 +3560,11 @@ function renderSchoolDetail() {
       <div class="card">
         <div class="card-header">
           <span class="card-title">用户管理</span>
-          <button class="btn btn-primary" onclick="showAddUser()">+ 添加用户</button>
+          <div class="card-actions">
+            <button class="btn btn-success" onclick="bulkSetUsersStatus('active')">一键全启动</button>
+            <button class="btn btn-secondary" onclick="bulkSetUsersStatus('paused')">一键全暂停</button>
+            <button class="btn btn-primary" onclick="showAddUser()">+ 添加用户</button>
+          </div>
         </div>
         \${users.length ? \`
           <table class="user-table">
@@ -3133,6 +3574,7 @@ function renderSchoolDetail() {
                 <th>昵称</th>
                 <th>状态</th>
                 <th>今日计划</th>
+                <th>今日备选</th>
                 <th>操作</th>
               </tr>
             </thead>
@@ -3151,12 +3593,22 @@ function renderSchoolDetail() {
                   if (active.length === 0) return "已启用/无有效时段";
                   return active.map(s => s.times).join(" | ");
                 })();
+                const backupStr = (() => {
+                  if (!todaySch || !todaySch.enabled) return "-";
+                  const slots = todaySch.slots || [{ backupSeats: todaySch.backupSeats }];
+                  const values = slots
+                    .flatMap(s => String(s.backupSeats || "").split(/[,\uFF0C|]/))
+                    .map(v => v.trim())
+                    .filter(Boolean);
+                  return values.length ? values[0] : "-";
+                })();
                 return \`
                   <tr>
                     <td>\${u.phone || "-"}</td>
                     <td>\${u.username || u.remark || "-"}</td>
                     <td class="status-\${u.status}">\${u.status === "active" ? "活跃" : "暂停"}</td>
                     <td style="font-size:12px">\${todayStr}</td>
+                    <td class="backup-seat-list">\${escapeHtml(backupStr)}</td>
                     <td class="actions">
                       <button class="btn btn-sm btn-secondary" onclick="showEditUser('\${u.id}')">编辑</button>
                       \${u.status === "active" 
@@ -3402,18 +3854,18 @@ function renderEditSchoolModal() {
           </div>
           <div class="form-row">
             <div class="form-group">
-              <label>提前登录秒数（login_lead_seconds）</label>
-              <input type="number" id="edit_strategy_login" value="\${st.login_lead_seconds || 14}">
+              <label>提前登录随机范围（login_lead_seconds_range）</label>
+              <input type="text" id="edit_strategy_login_range" value="\${(st.login_lead_seconds_range || [st.login_lead_seconds || 14, st.login_lead_seconds || 14]).join(',')}" placeholder="例如: 16,25">
             </div>
             <div class="form-group">
-              <label>提前滑块秒数（slider_lead_seconds）</label>
-              <input type="number" id="edit_strategy_slider" value="\${st.slider_lead_seconds || 10}">
+              <label>提前滑块随机范围（slider_lead_seconds_range）</label>
+              <input type="text" id="edit_strategy_slider_range" value="\${(st.slider_lead_seconds_range || [st.slider_lead_seconds || 10, st.slider_lead_seconds || 10]).join(',')}" placeholder="例如: 8,14">
             </div>
           </div>
           <div class="form-row">
             <div class="form-group">
-              <label>首枪偏移毫秒（first_submit_offset_ms）</label>
-              <input type="number" id="edit_strategy_first" value="\${st.first_submit_offset_ms || 9}">
+              <label>首枪偏移随机范围（first_submit_offset_range_ms）</label>
+              <input type="text" id="edit_strategy_first_range" value="\${(st.first_submit_offset_range_ms || [st.first_submit_offset_ms || 9, st.first_submit_offset_ms || 9]).join(',')}" placeholder="例如: 5,30">
             </div>
             <div class="form-group">
               <label>取 token 延迟毫秒（token_fetch_delay_ms）</label>
@@ -3422,12 +3874,29 @@ function renderEditSchoolModal() {
           </div>
           <div class="form-row">
             <div class="form-group">
-              <label>轻探测开始毫秒（fast_probe_start_offset_ms）</label>
-              <input type="number" id="edit_strategy_probe_start" value="\${st.fast_probe_start_offset_ms || 14}">
-            </div>
-            <div class="form-group">
               <label>轻探测随机范围（fast_probe_start_range_ms）</label>
               <input type="text" id="edit_strategy_probe_start_range" value="\${(st.fast_probe_start_range_ms || [st.fast_probe_start_offset_ms || 14, st.fast_probe_start_offset_ms || 14]).join(',')}" placeholder="例如: 8,20">
+            </div>
+            <div class="form-group">
+              <label>预取 token 随机范围（pre_fetch_token_range_ms）</label>
+              <input type="text" id="edit_strategy_prefetch_range" value="\${(st.pre_fetch_token_range_ms || [st.pre_fetch_token_ms || 1531, st.pre_fetch_token_ms || 1531]).join(',')}" placeholder="例如: 1200,2400">
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>连接预热提前毫秒（warm_connection_lead_ms）</label>
+              <input type="number" id="edit_strategy_warm_lead" value="\${st.warm_connection_lead_ms || 2400}">
+            </div>
+            <div class="form-group"></div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>正式取 token 超时毫秒（token_fetch_timeout_ms）</label>
+              <input type="number" id="edit_strategy_token_timeout" min="1" value="\${st.token_fetch_timeout_ms || 2830}">
+            </div>
+            <div class="form-group">
+              <label>轻探测超时毫秒（fast_probe_timeout_ms）</label>
+              <input type="number" id="edit_strategy_fast_probe_timeout" min="1" value="\${st.fast_probe_timeout_ms || 2830}">
             </div>
           </div>
           <div class="form-row">
@@ -3439,16 +3908,6 @@ function renderEditSchoolModal() {
               </select>
             </div>
             <div class="form-group"></div>
-          </div>
-          <div class="form-row">
-            <div class="form-group">
-              <label>连接预热提前毫秒（warm_connection_lead_ms）</label>
-              <input type="number" id="edit_strategy_warm_lead" value="\${st.warm_connection_lead_ms || 2400}">
-            </div>
-            <div class="form-group">
-              <label>预取 token 提前毫秒（pre_fetch_token_ms）</label>
-              <input type="number" id="edit_strategy_prefetch" value="\${st.pre_fetch_token_ms || 1531}">
-            </div>
           </div>
           <div style="font-size:12px;color:#666;margin-top:6px">
             说明：学校批量触发时，会按固定批次拆成多个 workflow；当前每个 workflow 默认承载 10 个用户。
@@ -3473,6 +3932,16 @@ function renderUserModal() {
         </div>
         <div class="modal-body">
           <input type="hidden" id="edit_user_id">
+          <div id="user_migrate_tools" class="user-migrate-tools" style="display:none">
+            <div class="user-migrate-row">
+              <div class="form-group" style="margin-bottom:0">
+                <label>迁移到目标组 ID</label>
+                <input type="text" id="migrate_user_target_group" placeholder="输入目标组 ID">
+              </div>
+              <button type="button" id="migrateUserButton" class="btn btn-secondary" onclick="migrateCurrentUser()">迁移用户</button>
+            </div>
+            <div class="user-migrate-note">迁移会保留当前用户配置，并从当前组移除；目标组座位冲突时不会迁移。</div>
+          </div>
           <div class="form-row">
             <div class="form-group">
               <label>手机号（登录账号）</label>
@@ -3501,7 +3970,7 @@ function renderUserModal() {
               <input type="text" id="global_sync_times" placeholder="时间段 08:00-12:00">
               <input type="text" id="global_sync_seatPageId" placeholder="页面ID">
               <input type="text" id="global_sync_fidEnc" placeholder="fidEnc">
-              <span></span>
+              <input type="text" id="global_sync_backupSeats" placeholder="备选座位 13501-300,">
             </div>
             <div class="global-config-actions">
               <button type="button" class="btn btn-primary" onclick="applyUserGlobalConfigSync()">同步到已有配置</button>
@@ -3527,7 +3996,7 @@ function renderUserModal() {
                     <div class="schedule-day-fields" style="margin-top:4px">
                       <input type="text" id="sch_\${d}_s\${i}_seatPageId" placeholder="seatPageId">
                       <input type="text" id="sch_\${d}_s\${i}_fidEnc" placeholder="fidEnc">
-                      <span></span>
+                      <input type="text" id="sch_\${d}_s\${i}_backupSeats" placeholder="备选座位 13501-300,13502-340,">
                     </div>
                   </div>
                 \`).join("")}
@@ -3537,7 +4006,7 @@ function renderUserModal() {
           </div>
           <div class="form-group" style="margin-top:12px">
             <label>周计划 JSON 映射（单一输入框）</label>
-            <textarea id="edit_user_schedule_json" rows="8" placeholder='示例: [{"times":["09:00","23:00"],"roomid":"13484","seatid":["356"],"seatPageId":"13484","fidEnc":"4a18e12602b24c8c","daysofweek":["Monday","Tuesday"]}]'></textarea>
+            <textarea id="edit_user_schedule_json" rows="8" placeholder='示例: [{"times":["09:00","23:00"],"roomid":"13484","seatid":["356"],"seatPageId":"13484","fidEnc":"4a18e12602b24c8c","backupSeats":"13501-300,13502-340,","daysofweek":["Monday","Tuesday"]}]'></textarea>
             <button type="button" class="btn btn-secondary" onclick="applyScheduleJsonToForm()" style="margin-top:8px">映射到周计划配置</button>
           </div>
           <button id="saveUserButton" class="btn btn-primary" onclick="doSaveUser()" style="width:100%;margin-top:16px">保存用户</button>
@@ -3584,10 +4053,10 @@ async function doLogin() {
   refreshSchoolActiveTodayCounts(true);
 }
 
-async function loadSchools() {
+async function loadSchools(options = {}) {
   const res = await api("GET", "/api/schools");
   schools = getSortedSchoolsForDisplay(res.schools || []);
-  render();
+  if (!options.silent) render();
   refreshSchoolActiveTodayCounts();
 }
 
@@ -3685,7 +4154,10 @@ function backToSchools() {
   currentSchool = null;
   users = [];
   currentView = "schools";
-  loadSchools();
+  schools = getSortedSchoolsForDisplay(schools);
+  render();
+  refreshSchoolActiveTodayCounts();
+  loadSchools({ silent: true });
 }
 
 function showEditSchool() {
@@ -3707,7 +4179,41 @@ async function doEditSchool() {
     if (arr.length >= 2) return [arr[0], arr[1]];
     return [fallbackA, fallbackB];
   };
-  const probeStartRange = parseRangeInput("edit_strategy_probe_start_range", 14, 14);
+  const existingLoginLeadSeconds = parseInt((s.strategy || {}).login_lead_seconds, 10) || 14;
+  const loginLeadRange = parseRangeInput(
+    "edit_strategy_login_range",
+    existingLoginLeadSeconds,
+    existingLoginLeadSeconds,
+  );
+  const loginLeadSeconds = loginLeadRange[0];
+  const existingSliderLeadSeconds = parseInt((s.strategy || {}).slider_lead_seconds, 10) || 10;
+  const sliderLeadRange = parseRangeInput(
+    "edit_strategy_slider_range",
+    existingSliderLeadSeconds,
+    existingSliderLeadSeconds,
+  );
+  const sliderLeadSeconds = sliderLeadRange[0];
+  const existingProbeStartOffset = parseInt((s.strategy || {}).fast_probe_start_offset_ms, 10) || 14;
+  const probeStartRange = parseRangeInput(
+    "edit_strategy_probe_start_range",
+    existingProbeStartOffset,
+    existingProbeStartOffset,
+  );
+  const probeStartOffset = probeStartRange[0];
+  const existingFirstSubmitOffset = parseInt((s.strategy || {}).first_submit_offset_ms, 10) || 9;
+  const firstSubmitRange = parseRangeInput(
+    "edit_strategy_first_range",
+    existingFirstSubmitOffset,
+    existingFirstSubmitOffset,
+  );
+  const firstSubmitOffset = firstSubmitRange[0];
+  const existingPreFetchTokenMs = parseInt((s.strategy || {}).pre_fetch_token_ms, 10) || 1531;
+  const preFetchTokenRange = parseRangeInput(
+    "edit_strategy_prefetch_range",
+    existingPreFetchTokenMs,
+    existingPreFetchTokenMs,
+  );
+  const preFetchTokenMs = preFetchTokenRange[0];
   const readingZonesRaw = (document.getElementById("edit_school_reading_zones").value || "").trim();
   let readingZoneGroups = [];
   if (readingZonesRaw) {
@@ -3741,13 +4247,19 @@ async function doEditSchool() {
       ...baseStrategy,
       mode: document.getElementById("edit_strategy_mode").value,
       submit_mode: document.getElementById("edit_strategy_submit").value,
-      login_lead_seconds: parseInt(document.getElementById("edit_strategy_login").value) || 14,
-      slider_lead_seconds: parseInt(document.getElementById("edit_strategy_slider").value) || 10,
+      login_lead_seconds: loginLeadSeconds,
+      login_lead_seconds_range: loginLeadRange,
+      slider_lead_seconds: sliderLeadSeconds,
+      slider_lead_seconds_range: sliderLeadRange,
       warm_connection_lead_ms: parseInt(document.getElementById("edit_strategy_warm_lead").value) || 2400,
-      fast_probe_start_offset_ms: parseInt(document.getElementById("edit_strategy_probe_start").value) || 14,
-      pre_fetch_token_ms: parseInt(document.getElementById("edit_strategy_prefetch").value) || 1531,
-      first_submit_offset_ms: parseInt(document.getElementById("edit_strategy_first").value) || 9,
+      fast_probe_start_offset_ms: probeStartOffset,
+      pre_fetch_token_ms: preFetchTokenMs,
+      pre_fetch_token_range_ms: preFetchTokenRange,
+      first_submit_offset_ms: firstSubmitOffset,
+      first_submit_offset_range_ms: firstSubmitRange,
       token_fetch_delay_ms: parseInt(document.getElementById("edit_strategy_delay").value) || 45,
+      token_fetch_timeout_ms: parseInt(document.getElementById("edit_strategy_token_timeout").value) || 2830,
+      fast_probe_timeout_ms: parseInt(document.getElementById("edit_strategy_fast_probe_timeout").value) || 2830,
       first_token_date_mode: document.getElementById("edit_strategy_first_token_date_mode").value,
       fast_probe_start_range_ms: probeStartRange,
     }
@@ -3843,8 +4355,11 @@ async function stopTestEndtimeOverride() {
 
 function showAddUser(prefill = null) {
   setUserSavePending(false);
+  setUserMigratePending(false);
   document.getElementById("userModalTitle").textContent = "添加用户";
   document.getElementById("edit_user_id").value = "";
+  document.getElementById("user_migrate_tools").style.display = "none";
+  document.getElementById("migrate_user_target_group").value = "";
   document.getElementById("edit_user_phone").value = "";
   document.getElementById("edit_user_username").value = "";
   document.getElementById("edit_user_password").value = "";
@@ -3884,11 +4399,14 @@ function showAddUser(prefill = null) {
 
 async function showEditUser(userId) {
   setUserSavePending(false);
+  setUserMigratePending(false);
   const res = await api("GET", "/api/school/" + currentSchool.id + "/user/" + userId);
   if (res.error) return toast(res.error, "error");
   const u = res.user;
   document.getElementById("userModalTitle").textContent = "编辑用户";
   document.getElementById("edit_user_id").value = u.id;
+  document.getElementById("user_migrate_tools").style.display = "";
+  document.getElementById("migrate_user_target_group").value = "";
   document.getElementById("edit_user_phone").value = u.phone || "";
   document.getElementById("edit_user_username").value = u.username || "";
   document.getElementById("edit_user_password").value = "";
@@ -3932,6 +4450,32 @@ async function doSaveUser() {
   }
 }
 
+async function migrateCurrentUser() {
+  if (isMigratingUser) return;
+  const userId = document.getElementById("edit_user_id").value;
+  const targetSchoolId = document.getElementById("migrate_user_target_group").value.trim();
+  if (!userId) return toast("请先打开已有用户", "error");
+  if (!targetSchoolId) return toast("请填写目标组 ID", "error");
+  if (targetSchoolId === currentSchool.id) return toast("目标组不能和当前组相同", "error");
+  if (!confirm("确定将此用户迁移到组 " + targetSchoolId + "？")) return;
+
+  setUserMigratePending(true);
+  try {
+    const res = await api("POST", "/api/school/" + currentSchool.id + "/user/" + userId + "/migrate", {
+      target_school_id: targetSchoolId,
+    });
+    if (res.ok) {
+      toast("用户已迁移");
+      closeModal("userModal");
+      openSchool(currentSchool.id);
+    } else {
+      toast(res.error || "迁移失败", "error");
+    }
+  } finally {
+    setUserMigratePending(false);
+  }
+}
+
 async function pauseUser(userId) {
   await api("POST", "/api/school/" + currentSchool.id + "/user/" + userId + "/pause");
   toast("用户已暂停");
@@ -3942,6 +4486,24 @@ async function resumeUser(userId) {
   await api("POST", "/api/school/" + currentSchool.id + "/user/" + userId + "/resume");
   toast("用户已恢复");
   openSchool(currentSchool.id);
+}
+
+async function bulkSetUsersStatus(status) {
+  if (!currentSchool) return;
+  const isActive = status === "active";
+  const actionText = isActive ? "启动" : "暂停";
+  if (!confirm("确定一键" + actionText + "当前组所有用户？")) return;
+
+  const res = await api("POST", "/api/school/" + currentSchool.id + "/users/status", { status });
+  if (res.ok) {
+    toast(
+      "已" + actionText + " " + (res.updated || 0) + " 名用户"
+      + "，无需变更 " + (res.unchanged || 0) + " 名"
+    );
+    openSchool(currentSchool.id);
+  } else {
+    toast(res.error || ("一键" + actionText + "失败"), "error");
+  }
 }
 
 async function triggerUser(userId) {
@@ -3978,7 +4540,7 @@ setInterval(updateTestEndtimeStatusView, 1000);
     if (API_KEY) {
       const res = await api("GET", "/api/schools");
       if (!res.error) {
-        schools = Array.isArray(res.schools) ? res.schools : [];
+        schools = getSortedSchoolsForDisplay(res.schools || []);
         currentView = "schools";
       }
     }

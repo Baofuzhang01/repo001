@@ -55,13 +55,19 @@ Tongyi Worker 顶部注释和实际代码里使用的核心键如下：
     "mode": "C",
     "submit_mode": "serial",
     "login_lead_seconds": 18,
+    "login_lead_seconds_range": [18, 18],
     "slider_lead_seconds": 10,
+    "slider_lead_seconds_range": [10, 10],
     "fast_probe_start_offset_ms": 14,
     "fast_probe_start_range_ms": [14, 14],
     "warm_connection_lead_ms": 2400,
     "pre_fetch_token_ms": 1531,
+    "pre_fetch_token_range_ms": [1531, 1531],
     "first_submit_offset_ms": 9,
+    "first_submit_offset_range_ms": [9, 9],
     "token_fetch_delay_ms": 45,
+    "token_fetch_timeout_ms": 2830,
+    "fast_probe_timeout_ms": 2830,
     "first_token_date_mode": "submit_date",
     "burst_offsets_ms": [120, 420, 820],
     "burst_jitter_range_ms": [0, 0]
@@ -78,6 +84,8 @@ Tongyi Worker 顶部注释和实际代码里使用的核心键如下：
 - `dispatch_target`
 - `server_url`
 - `strategy`
+  - `login_lead_seconds_range` 是提前登录秒数随机范围。tongyi 派发用户时会在该闭区间内为每个用户生成 `login_lead_seconds`，并在范围容量足够时尽量避免同一批用户重复。
+  - `slider_lead_seconds_range` 是提前滑块秒数随机范围。tongyi 派发用户时会在该闭区间内为每个用户生成 `slider_lead_seconds`，并在范围容量足够时尽量避免同一批用户重复。
 
 ## 3. 用户对象结构
 

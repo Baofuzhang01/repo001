@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/termius_server_ed25519}"
-DEFAULT_DEPLOY_HOSTS="ubuntu@82.156.80.161 ubuntu@62.234.188.36 root@101.43.25.136"
+DEFAULT_DEPLOY_HOSTS="ubuntu@82.156.80.161 ubuntu@62.234.188.36 root@101.43.25.136 ubuntu@159.75.99.103 ubuntu@101.42.141.248"
 DEPLOY_HOSTS_TEXT="${DEPLOY_HOSTS:-${DEPLOY_HOST:-$DEFAULT_DEPLOY_HOSTS}}"
 REMOTE_PROJECT_DIR="${REMOTE_PROJECT_DIR:-/opt/Main_ChaoXingReserveSeat}"
 REMOTE_STATIC_DIR="${REMOTE_STATIC_DIR:-/usr/share/nginx/seat_qianduan}"
@@ -93,7 +93,7 @@ fi
 if [[ -x '$REMOTE_PROJECT_DIR/.venv/bin/python' ]]; then
   run_root '$REMOTE_PROJECT_DIR/.venv/bin/pip' uninstall -y opencv-python opencv-contrib-python opencv-contrib-python-headless cv2 >/dev/null 2>&1 || true
   run_root '$REMOTE_PROJECT_DIR/.venv/bin/pip' install -r requirements.txt
-  run_root '$REMOTE_PROJECT_DIR/.venv/bin/python' -m py_compile main.py server_dispatch.py qianduan/server_api_example.py server_store/repository.py
+  run_root '$REMOTE_PROJECT_DIR/.venv/bin/python' -m py_compile main.py server_dispatch.py qianduan/server_api_example.py server_store/repository.py server_store/allocate_backup_seats.py
   run_root '$REMOTE_PROJECT_DIR/.venv/bin/python' - <<'PY'
 import cv2
 if not hasattr(cv2, 'imdecode'):
@@ -101,7 +101,7 @@ if not hasattr(cv2, 'imdecode'):
 print('cv2 ok', getattr(cv2, '__version__', 'unknown'))
 PY
 else
-  python3 -m py_compile main.py server_dispatch.py qianduan/server_api_example.py server_store/repository.py
+  python3 -m py_compile main.py server_dispatch.py qianduan/server_api_example.py server_store/repository.py server_store/allocate_backup_seats.py
 fi
 run_root rsync -av --delete \
   --include 'index.html' \

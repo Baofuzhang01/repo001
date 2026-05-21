@@ -212,6 +212,7 @@ run_root "$VENV_DIR/bin/python" -m py_compile \
   "$PROJECT_DIR/server_dispatch.py" \
   "$PROJECT_DIR/qianduan/server_api_example.py" \
   "$PROJECT_DIR/server_store/repository.py" \
+  "$PROJECT_DIR/server_store/allocate_backup_seats.py" \
   "$PROJECT_DIR/server_store/renewal_scan.py"
 run_root "$VENV_DIR/bin/python" - <<'PY'
 import cv2
@@ -307,6 +308,32 @@ Unit=seat-sync-pull.service
 WantedBy=timers.target
 EOF
 
+run_root tee /etc/systemd/system/seat-backup-seat-allocate.service >/dev/null <<EOF
+[Unit]
+Description=Seat backup seat allocation
+After=network-online.target seat-sync-pull.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=$PROJECT_DIR
+EnvironmentFile=$ENV_FILE
+ExecStart=$VENV_DIR/bin/python $PROJECT_DIR/server_store/allocate_backup_seats.py
+EOF
+
+run_root tee /etc/systemd/system/seat-backup-seat-allocate.timer >/dev/null <<EOF
+[Unit]
+Description=Run Seat Backup Seat Allocation Every Day At 04:00
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+Unit=seat-backup-seat-allocate.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
 run_root tee /etc/systemd/system/seat-renewal-scan.service >/dev/null <<EOF
 [Unit]
 Description=Seat renewal daily scan
@@ -397,6 +424,7 @@ run_root systemctl enable --now "$DISPATCH_SERVICE"
 if [[ "$ENABLE_SYNC_TIMERS" == "1" ]]; then
   run_root systemctl enable --now seat-sync-push.timer
   run_root systemctl enable --now seat-sync-pull.timer
+  run_root systemctl enable --now seat-backup-seat-allocate.timer
 fi
 
 if [[ "$ENABLE_RENEWAL_TIMER" == "1" ]]; then
