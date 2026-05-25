@@ -681,6 +681,7 @@ def build_result(run_dir: pathlib.Path, summary: dict, payload: dict, item: dict
     configured_slot_count = len([slot for slot in user_slots if slot.get("time") or slot.get("primary")])
     success_slots = [slot for slot in time_slot_results if slot.get("success")]
     backup_success_slots = [slot for slot in success_slots if slot.get("source") == "backup"]
+    unknown_success_slots = [slot for slot in success_slots if slot.get("source") not in {"primary", "backup"}]
     failed_slots = [slot for slot in time_slot_results if not slot.get("success")]
 
     primary_result = "unknown"
@@ -694,6 +695,14 @@ def build_result(run_dir: pathlib.Path, summary: dict, payload: dict, item: dict
             primary_result = "部分失败" if failed_slots else "部分使用备选"
             backup_result = "success"
             final_reason = f"抢座成功：{len(success_slots)}个时间段成功，其中{len(backup_success_slots)}个使用备选座位，最终座位{final_seat or '未识别'}"
+        elif unknown_success_slots and all_success:
+            status = "success"
+            primary_result = "success"
+            backup_result = "skipped"
+            if configured_slot_count > 1:
+                final_reason = f"抢座成功：{len(success_slots)}个时间段成功，最终座位{final_seat or '未识别'}"
+            else:
+                final_reason = f"抢座成功：座位{final_seat or '未识别'}预约成功"
         elif all_success:
             status = "primary_success"
             primary_result = "success"
