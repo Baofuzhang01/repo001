@@ -227,6 +227,10 @@ class reserve:
             float(os.getenv("CX_CONNECT_TIMEOUT", "3.05")),
             float(os.getenv("CX_READ_TIMEOUT", "5")),
         )
+        self.submit_request_timeout = (
+            float(os.getenv("CX_SUBMIT_CONNECT_TIMEOUT", "5")),
+            float(os.getenv("CX_SUBMIT_READ_TIMEOUT", "18")),
+        )
         # 策略 C 的轻探测超时：只用于 probe_not_open_fast() 判断页面是否仍未开放。
         self.fast_probe_timeout = (
             float(os.getenv("CX_FAST_PROBE_CONNECT_TIMEOUT", "2.83")),
@@ -335,38 +339,91 @@ class reserve:
         return urls
 
     def _submit_with_fallback(self, parm: dict, *, request_name: str):
-        families = [self.api_family, self._alternate_api_family(self.api_family)]
-        tried = set()
+        family = self.api_family
+        submit_url = self.api_urls[family]["submit"]
+        started_at = time.monotonic()
+        try:
+            response = self._post(
+                url=submit_url,
+                data=parm,
+                verify=False,
+                request_name=request_name,
+                attempts=1,
+                timeout=self.submit_request_timeout,
+            )
+        except requests.exceptions.RequestException as e:
+            elapsed_seconds = time.monotonic() - started_at
+            is_read_timeout = isinstance(e, requests.exceptions.ReadTimeout)
+            is_connect_timeout = isinstance(e, requests.exceptions.ConnectTimeout)
+            diagnostic = {
+                "request_name": request_name,
+                "exception_type": type(e).__name__,
+                "exception": str(e),
+                "api_family": family,
+                "submit_url": submit_url,
+                "elapsed_seconds": round(elapsed_seconds, 3),
+                "connect_timeout_seconds": self.submit_request_timeout[0],
+                "read_timeout_seconds": self.submit_request_timeout[1],
+                "request_may_have_reached_server": not is_connect_timeout,
+                "read_timeout": is_read_timeout,
+                "connect_timeout": is_connect_timeout,
+                "automatic_resend": False,
+                "day": parm.get("day", ""),
+                "roomId": parm.get("roomId", ""),
+                "seatNum": parm.get("seatNum", ""),
+                "startTime": parm.get("startTime", ""),
+                "endTime": parm.get("endTime", ""),
+                "deptIdEnc": parm.get("deptIdEnc", ""),
+                "captcha_present": bool(parm.get("captcha")),
+                "wyToken_present": bool(parm.get("wyToken")),
+                "enc_present": bool(parm.get("enc")),
+            }
+            self.last_submit_result = {
+                "success": False,
+                "msg": "提交请求未收到响应，需要重新获取token和验证码",
+                "requires_fresh_credentials": True,
+                "error": str(e),
+                "diagnostic": diagnostic,
+            }
+            logging.warning(
+                "seat submit transport failure; next submit must use fresh token and captcha: %s",
+                json.dumps(diagnostic, ensure_ascii=False, separators=(",", ":")),
+            )
+            return None
 
-        for family in families:
-            submit_url = self.api_urls[family]["submit"]
-            if submit_url in tried:
-                continue
-            tried.add(submit_url)
-            try:
-                response = self._post(
-                    url=submit_url,
-                    data=parm,
-                    verify=False,
-                    request_name=request_name,
-                )
-            except requests.exceptions.RequestException as e:
-                logging.warning(f"Seat submit request failed via {family}: {e}")
-                continue
-
-            html = response.content.decode("utf-8")
-            try:
-                data = json.loads(html)
-            except ValueError as e:
-                logging.warning(
-                    f"Failed to parse seat submit response via {family}: {e}; body={html[:200]}"
-                )
-                continue
-
-            if family != self.api_family:
-                logging.info(f"Seat submit fallback switched API family to {family}")
-                self._set_api_family(family)
-            return data
+        elapsed_seconds = time.monotonic() - started_at
+        html = response.content.decode("utf-8")
+        try:
+            return json.loads(html)
+        except ValueError as e:
+            diagnostic = {
+                "request_name": request_name,
+                "exception_type": type(e).__name__,
+                "exception": str(e),
+                "api_family": family,
+                "submit_url": submit_url,
+                "http_status": response.status_code,
+                "elapsed_seconds": round(elapsed_seconds, 3),
+                "automatic_resend": False,
+                "response_body_prefix": html[:500],
+                "day": parm.get("day", ""),
+                "roomId": parm.get("roomId", ""),
+                "seatNum": parm.get("seatNum", ""),
+                "startTime": parm.get("startTime", ""),
+                "endTime": parm.get("endTime", ""),
+            }
+            self.last_submit_result = {
+                "success": False,
+                "msg": "提交响应无法解析，需要重新获取token和验证码",
+                "requires_fresh_credentials": True,
+                "error": str(e),
+                "diagnostic": diagnostic,
+            }
+            logging.warning(
+                "seat submit response parse failure; next submit must use fresh token and captcha: %s",
+                json.dumps(diagnostic, ensure_ascii=False, separators=(",", ":")),
+            )
+            return None
 
         return None
 

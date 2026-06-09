@@ -1334,6 +1334,10 @@ def strategic_first_attempt(
             return str(s.last_submit_result.get("msg", ""))
 
         def _last_submit_failed_by_captcha() -> bool:
+            if isinstance(s.last_submit_result, dict) and s.last_submit_result.get(
+                "requires_fresh_credentials"
+            ):
+                return True
             msg = _last_submit_failure_msg()
             return "验证码" in msg or "captcha" in msg.lower()
 
